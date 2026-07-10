@@ -5,6 +5,7 @@ WPA Handshake Capture v3
 - ANonce extraction from EAPOL frames
 - Full 4-way handshake reconstruction
 - hashcat -m 22000 compatible output
+- Works in MANAGED mode with wpa_supplicant (no monitor needed)
 """
 
 import os, re, json, time, subprocess, tempfile, shutil
