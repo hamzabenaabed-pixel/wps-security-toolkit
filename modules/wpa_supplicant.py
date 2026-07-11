@@ -5,6 +5,7 @@ Complete management of wpa_supplicant via wpa_cli
 Works on managed mode - no monitor mode needed
 """
 
+import os
 import subprocess
 import re
 import time
@@ -645,6 +646,3 @@ class WpaSupplicant:
         # wpa_supplicant doesn't have native notes,
         # but we can store in our DB
         pass
-
-
-import os

