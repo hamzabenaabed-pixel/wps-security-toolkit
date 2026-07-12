@@ -127,6 +127,77 @@ class Database:
     );
     CREATE INDEX IF NOT EXISTS idx_wps_attempt_bssid
         ON wps_pin_attempts(bssid,attempted_at DESC);
+    CREATE TABLE IF NOT EXISTS router_audits(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        target_ip TEXT NOT NULL,
+        started_at TEXT DEFAULT (datetime('now','localtime')),
+        finished_at TEXT,
+        brand TEXT,
+        confidence INTEGER DEFAULT 0,
+        title TEXT,
+        open_ports TEXT,
+        auth_status TEXT,
+        username TEXT,
+        password TEXT,
+        auth_method TEXT,
+        summary TEXT,
+        warnings TEXT,
+        report_json TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_router_audits_ip_time
+        ON router_audits(target_ip, started_at DESC);
+    CREATE TABLE IF NOT EXISTS router_probe_state(
+        target_ip TEXT PRIMARY KEY,
+        brand TEXT,
+        window_started_at TEXT,
+        attempts_in_window INTEGER DEFAULT 0,
+        total_attempts INTEGER DEFAULT 0,
+        last_attempt_at TEXT,
+        last_auth_status TEXT,
+        last_detail TEXT,
+        lockout_until TEXT,
+        lockout_count INTEGER DEFAULT 0,
+        last_lockout_at TEXT,
+        verified_at TEXT,
+        updated_at TEXT DEFAULT (datetime('now','localtime')),
+        extra_json TEXT
+    );
+    CREATE TABLE IF NOT EXISTS vuln_lookups(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        queried_at TEXT DEFAULT (datetime('now','localtime')),
+        vendor TEXT,
+        model TEXT,
+        title TEXT,
+        online INTEGER DEFAULT 0,
+        match_count INTEGER DEFAULT 0,
+        report_json TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS candidate_pins(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        bssid TEXT NOT NULL,
+        essid TEXT,
+        pin TEXT NOT NULL,
+        source TEXT,
+        status TEXT DEFAULT 'unverified',
+        confidence INTEGER DEFAULT 50,
+        notes TEXT,
+        created_at TEXT DEFAULT (datetime('now','localtime')),
+        verified_at TEXT,
+        psk TEXT,
+        UNIQUE(bssid,pin)
+    );
+    CREATE INDEX IF NOT EXISTS idx_candidate_pins_bssid
+        ON candidate_pins(bssid, created_at DESC);
+    CREATE TABLE IF NOT EXISTS evidence_index(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        bssid TEXT,
+        essid TEXT,
+        action TEXT,
+        status TEXT,
+        path TEXT,
+        created_at TEXT DEFAULT (datetime('now','localtime'))
+    );
     """
 
     def __init__(self):
@@ -196,9 +267,19 @@ class Database:
         self.execute("UPDATE networks SET is_target=? WHERE id=?", (1 if val else 0, nid))
 
     def search_networks(self, q):
+        pattern = "%{q}%".format(q=q)
         return self.fetch_all(
             "SELECT * FROM networks WHERE essid LIKE ? OR bssid LIKE ? OR notes LIKE ?",
-            (f"%{q}%",f"%{q}%",f"%{q}%"))
+            (pattern, pattern, pattern),
+        )
+
+    def get_activity_summary(self, limit=20):
+        """Recent activity for dashboard / reports."""
+        return self.fetch_all(
+            """SELECT timestamp, event_type, category, message, severity
+               FROM activity_log ORDER BY timestamp DESC, id DESC LIMIT ?""",
+            (int(limit),),
+        )
 
     def get_stats(self):
         s = {}
@@ -217,8 +298,17 @@ class Database:
         return cur.lastrowid
 
     def update_session(self, sid, **kwargs):
-        sets = ",".join(k+"=?" for k in kwargs)
-        self.execute(f"UPDATE sessions SET {sets} WHERE id=?", (*kwargs.values(),sid))
+        """Update session fields. Only allow known column names."""
+        allowed = {
+            "bssid", "essid", "attack_type", "start_time", "end_time",
+            "status", "pin_found", "psk_found", "attempts", "log_path",
+        }
+        clean = {k: v for k, v in kwargs.items() if k in allowed}
+        if not clean:
+            return
+        sets = ",".join("{col}=?".format(col=k) for k in clean)
+        query = "UPDATE sessions SET {sets} WHERE id=?".format(sets=sets)
+        self.execute(query, (*clean.values(), sid))
 
     def get_sessions(self, limit=50):
         return self.fetch_all("SELECT * FROM sessions ORDER BY start_time DESC LIMIT ?",(limit,))
@@ -228,8 +318,50 @@ class Database:
 
     # ── Credentials ──
     def add_credential(self, bssid, essid, pin, psk, method):
-        self.execute("INSERT INTO credentials(bssid,essid,pin,psk,method) VALUES(?,?,?,?,?)",
-                    (bssid,essid,pin,psk,method))
+        """
+        Store a credential row.
+
+        Safety: WPS-style methods require a non-empty PSK to be treated as a
+        real success. PIN-only inserts are rejected for those methods so the
+        vault does not accumulate misleading false positives.
+        """
+        pin_text = (pin or "").strip() or None
+        psk_text = (psk or "").strip() or None
+        method_text = (method or "").strip() or "unknown"
+        method_upper = method_text.upper()
+
+        wps_like = any(
+            token in method_upper
+            for token in (
+                "WPS", "PIXIE", "SMART ATTACK", "AUTO-WPS", "PIN (",
+                "SUGGESTED PIN", "BEST-PIN", "PBC",
+            )
+        )
+        if wps_like and not psk_text:
+            self.log(
+                "credential_rejected",
+                "security",
+                "Rejected PIN-only credential for {bssid} method={method}".format(
+                    bssid=bssid or "?",
+                    method=method_text,
+                ),
+                severity="warn",
+            )
+            return None
+
+        cur = self.execute(
+            "INSERT INTO credentials(bssid,essid,pin,psk,method) VALUES(?,?,?,?,?)",
+            (bssid, essid, pin_text, psk_text, method_text),
+        )
+        if psk_text and bssid:
+            try:
+                self.execute(
+                    "UPDATE networks SET status='compromised' WHERE bssid=?",
+                    (bssid,),
+                )
+            except Exception:
+                pass
+        return cur.lastrowid
 
     def get_credentials(self):
         return self.fetch_all("SELECT * FROM credentials ORDER BY captured_at DESC")
@@ -448,11 +580,230 @@ class Database:
         )
         return {"attempted": total, "latest": dict(latest) if latest else None}
 
+    # ── Router web audits ──
+    def save_router_audit(self, report):
+        """Persist a router web-audit report. Only store verified auth secrets."""
+        if not isinstance(report, dict):
+            return None
+
+        fingerprint = report.get("fingerprint") or {}
+        creds = report.get("credentials") or []
+        verified = [c for c in creds if c.get("status") == "success"]
+        chosen = verified[0] if verified else {}
+
+        # Never persist unverified passwords
+        username = chosen.get("username") if chosen else None
+        password = chosen.get("password") if chosen else None
+        auth_method = chosen.get("method") if chosen else None
+        auth_status = report.get("auth_status") or (
+            "success" if verified else "unknown"
+        )
+
+        open_ports = report.get("open_ports") or []
+        warnings = report.get("warnings") or []
+        cur = self.execute(
+            """INSERT INTO router_audits(
+               target_ip,started_at,finished_at,brand,confidence,title,
+               open_ports,auth_status,username,password,auth_method,
+               summary,warnings,report_json
+               ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                report.get("ip"),
+                report.get("started_at"),
+                report.get("finished_at"),
+                fingerprint.get("brand"),
+                int(fingerprint.get("confidence") or 0),
+                fingerprint.get("title"),
+                json.dumps(open_ports, ensure_ascii=False),
+                auth_status,
+                username,
+                password,
+                auth_method,
+                report.get("summary"),
+                json.dumps(warnings, ensure_ascii=False),
+                json.dumps(report, ensure_ascii=False, default=str),
+            ),
+        )
+        self.log(
+            "router_audit",
+            "router",
+            "Audit {ip} brand={brand} auth={auth}".format(
+                ip=report.get("ip"),
+                brand=fingerprint.get("brand"),
+                auth=auth_status,
+            ),
+        )
+        return cur.lastrowid
+
+    def get_router_audits(self, limit=50):
+        return self.fetch_all(
+            """SELECT id,target_ip,started_at,brand,confidence,auth_status,
+                      username,summary,title
+               FROM router_audits
+               ORDER BY started_at DESC,id DESC LIMIT ?""",
+            (int(limit),),
+        )
+
+    def get_router_audit(self, audit_id):
+        return self.fetch_one(
+            "SELECT * FROM router_audits WHERE id=?",
+            (int(audit_id),),
+        )
+
+    def get_probe_state(self, target_ip):
+        return self.fetch_one(
+            "SELECT * FROM router_probe_state WHERE target_ip=?",
+            (str(target_ip or "").strip(),),
+        )
+
+    def upsert_probe_state(self, target_ip, state):
+        """Insert/update smart probe state for one target IP."""
+        target_ip = str(target_ip or "").strip()
+        if not target_ip:
+            return None
+        extra = {
+            k: v for k, v in (state or {}).items()
+            if k not in {
+                "target_ip", "brand", "window_started_at", "attempts_in_window",
+                "total_attempts", "last_attempt_at", "last_auth_status",
+                "last_detail", "lockout_until", "lockout_count",
+                "last_lockout_at", "verified_at", "updated_at", "extra_json",
+            }
+        }
+        return self.execute(
+            """INSERT INTO router_probe_state(
+               target_ip,brand,window_started_at,attempts_in_window,total_attempts,
+               last_attempt_at,last_auth_status,last_detail,lockout_until,
+               lockout_count,last_lockout_at,verified_at,updated_at,extra_json
+               ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,datetime('now','localtime'),?)
+               ON CONFLICT(target_ip) DO UPDATE SET
+                 brand=excluded.brand,
+                 window_started_at=excluded.window_started_at,
+                 attempts_in_window=excluded.attempts_in_window,
+                 total_attempts=excluded.total_attempts,
+                 last_attempt_at=excluded.last_attempt_at,
+                 last_auth_status=excluded.last_auth_status,
+                 last_detail=excluded.last_detail,
+                 lockout_until=excluded.lockout_until,
+                 lockout_count=excluded.lockout_count,
+                 last_lockout_at=excluded.last_lockout_at,
+                 verified_at=excluded.verified_at,
+                 updated_at=datetime('now','localtime'),
+                 extra_json=excluded.extra_json
+            """,
+            (
+                target_ip,
+                state.get("brand"),
+                state.get("window_started_at"),
+                int(state.get("attempts_in_window") or 0),
+                int(state.get("total_attempts") or 0),
+                state.get("last_attempt_at"),
+                state.get("last_auth_status"),
+                state.get("last_detail"),
+                state.get("lockout_until"),
+                int(state.get("lockout_count") or 0),
+                state.get("last_lockout_at"),
+                state.get("verified_at"),
+                json.dumps(extra, ensure_ascii=False, default=str) if extra else None,
+            ),
+        )
+
+    def clear_probe_lockout(self, target_ip):
+        self.execute(
+            """UPDATE router_probe_state
+               SET lockout_until=NULL, updated_at=datetime('now','localtime')
+               WHERE target_ip=?""",
+            (str(target_ip or "").strip(),),
+        )
+
+    def save_vuln_lookup(self, report):
+        query = (report or {}).get("query") or {}
+        offline = (report or {}).get("offline") or {}
+        cur = self.execute(
+            """INSERT INTO vuln_lookups(vendor,model,title,online,match_count,report_json)
+               VALUES(?,?,?,?,?,?)""",
+            (
+                query.get("vendor"),
+                query.get("model"),
+                query.get("title"),
+                1 if query.get("online") else 0,
+                int(offline.get("match_count") or len((report or {}).get("cves") or [])),
+                json.dumps(report, ensure_ascii=False, default=str),
+            ),
+        )
+        return cur.lastrowid
+
+    def get_vuln_lookups(self, limit=30):
+        return self.fetch_all(
+            """SELECT id,queried_at,vendor,model,title,online,match_count
+               FROM vuln_lookups ORDER BY queried_at DESC,id DESC LIMIT ?""",
+            (int(limit),),
+        )
+
     # ── Maintenance ──
+    
+    # ── Candidate PINs (Pixie offline hits, etc.) ──
+    def save_candidate_pin(self, bssid, pin, essid="", source="pixie", confidence=70, notes="", status="unverified"):
+        pin = (pin or "").strip()
+        bssid = (bssid or "").upper()
+        if not pin or not bssid:
+            return None
+        cur = self.execute(
+            """INSERT INTO candidate_pins(bssid,essid,pin,source,status,confidence,notes)
+               VALUES(?,?,?,?,?,?,?)
+               ON CONFLICT(bssid,pin) DO UPDATE SET
+                 essid=excluded.essid,
+                 source=excluded.source,
+                 status=excluded.status,
+                 confidence=excluded.confidence,
+                 notes=excluded.notes
+            """,
+            (bssid, essid, pin, source, status, int(confidence), notes),
+        )
+        self.log("candidate_pin", "wps", "Saved candidate PIN for {b} from {s}".format(b=bssid, s=source))
+        return cur.lastrowid
+
+    def get_candidate_pins(self, bssid=None, limit=50):
+        if bssid:
+            return self.fetch_all(
+                """SELECT * FROM candidate_pins WHERE bssid=?
+                   ORDER BY created_at DESC LIMIT ?""",
+                (str(bssid).upper(), int(limit)),
+            )
+        return self.fetch_all(
+            "SELECT * FROM candidate_pins ORDER BY created_at DESC LIMIT ?",
+            (int(limit),),
+        )
+
+    def mark_candidate_verified(self, bssid, pin, psk):
+        self.execute(
+            """UPDATE candidate_pins
+               SET status='verified', psk=?, verified_at=datetime('now','localtime')
+               WHERE bssid=? AND pin=?""",
+            (psk, str(bssid).upper(), str(pin)),
+        )
+
+    def save_evidence_index(self, bssid, essid, action, status, path):
+        return self.execute(
+            """INSERT INTO evidence_index(bssid,essid,action,status,path)
+               VALUES(?,?,?,?,?)""",
+            (bssid, essid, action, status, path),
+        ).lastrowid
+
     def backup(self):
-        fname = f"bk_{datetime.now():%Y%m%d_%H%M%S}.db"
+        fname = "bk_{ts}.db".format(ts=datetime.now().strftime("%Y%m%d_%H%M%S"))
         dest = DB_PATH.parent.parent / "reports" / fname
-        shutil.copy2(DB_PATH, dest)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        # Prefer a consistent SQLite snapshot when possible
+        try:
+            with self.lock:
+                backup_conn = sqlite3.connect(str(dest))
+                try:
+                    self.conn.backup(backup_conn)
+                finally:
+                    backup_conn.close()
+        except Exception:
+            shutil.copy2(DB_PATH, dest)
         return str(dest)
 
     def close(self):

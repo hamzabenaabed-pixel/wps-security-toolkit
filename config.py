@@ -20,6 +20,9 @@ DEFAULTS = {
     "dont_touch_settings": True,
     "restore_processes": True,
     "verbose": False,
+    "min_rssi_online": -85,
+    "lab_mode": False,
+    "require_force_phrase": True,
 }
 
 class Config:
